@@ -16,6 +16,7 @@
   rocmPackages,
   vulkan-headers,
   vulkan-loader,
+  spirv-headers,
   openssl,
   shaderc,
   spirv-headers,
@@ -103,6 +104,7 @@ let
     vulkan-headers
     vulkan-loader
     shaderc
+    spirv-headers
   ];
 in
 
