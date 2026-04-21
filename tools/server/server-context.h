@@ -10,6 +10,8 @@
 #include <memory>
 #include <set>
 
+class server_model_manager; // forward declaration
+
 struct server_context_impl; // private implementation
 
 struct server_context_meta {
@@ -61,6 +63,27 @@ struct server_context {
     // returns true on success
     bool load_model(common_params & params);
 
+    // Load a new model (destroys current model if any, then loads new one)
+    // Blocks until all slots are idle (SLOT_STATE_IDLE) before swapping
+    // Returns true on success
+    bool swap_model(const common_params & params);
+
+    // Unload the current model (keeps context alive, clears model/slots)
+    // Blocks until all slots are idle before destroying
+    void unload_current_model();
+
+    // Post a model swap task to the queue (async, non-blocking)
+    void post_swap(const common_params & params);
+
+    // Check if a model is currently loaded
+    bool has_model_loaded() const;
+
+    // Get the currently loaded model's name
+    std::string get_current_model_name() const;
+
+    // Get the currently loaded model's chat params
+    const server_chat_params& get_chat_params() const;
+
     // this function will block main thread until termination
     void start_loop();
 
@@ -88,9 +111,19 @@ struct server_context {
 struct server_res_generator;
 
 struct server_routes {
-    server_routes(const common_params & params, server_context & ctx_server);
+    friend struct server_context_impl;
+    server_routes(const common_params & params, server_context & ctx_server, server_model_manager * model_manager = nullptr);
+
+    // Get metadata from the public server_context (for use in handlers)
+    server_context_meta get_ctx_meta() const;
+
+    // Get the public server_context reference (for model swap operations)
+    server_context& get_ctx_server() const {
+        return ctx_server_ref;
+    }
 
     void init_routes();
+    void set_model_manager(server_model_manager * mm) { model_manager = mm; }
 
     // note: this is not thread-safe and can only when ctx_http.is_ready is false
     void update_meta(const server_context & ctx_server) {
@@ -138,9 +171,12 @@ private:
     std::unique_ptr<const server_context_meta> meta;
 
     const common_params & params;
-    const server_context_impl & ctx_server;
+    const server_context_impl & ctx_server_impl;
+    server_context & ctx_server_ref;
+    server_model_manager * model_manager;
 
     server_queue & queue_tasks;
     server_response & queue_results;
     std::unique_ptr<server_res_generator> create_response(bool bypass_sleep = false);
+    std::function<void(const std::string &)> swap_if_needed_fn;
 };
