@@ -706,6 +706,9 @@ private:
     bool sleeping = false;
 
     void destroy() {
+        // Note: sleeping is set to true by handle_sleeping_state after destroy().
+        // unload_current_model() must also set sleeping = true to prevent
+        // the destructor from calling destroy() again (double free).
         llama_init.reset();
 
         ctx = nullptr;
@@ -1051,6 +1054,7 @@ private:
         }
 
         destroy();
+        sleeping = true;  // prevent destructor from calling destroy() again
         SRV_INF("%s", "model unloaded\n");
     }
 
