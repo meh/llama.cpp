@@ -105,7 +105,8 @@ private:
     common_params base_params;
     std::string bin_path;
     std::vector<std::string> base_env;
-    common_preset base_preset; // base preset from llama-server CLI args
+    common_preset base_preset; // base preset from llama-server CLI args (before first --)
+    std::vector<common_preset> model_presets; // per-model presets (one per -- block)
 
     void update_meta(const std::string & name, const server_model_meta & meta);
 
@@ -220,3 +221,6 @@ private:
         std::string content_type;
     };
 };
+
+// Helper to send a successful JSON response
+void res_ok(std::unique_ptr<server_http_res> & res, const json & response_data);

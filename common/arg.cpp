@@ -476,6 +476,11 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         std::set<std::string> seen_args;
 
         for (int i = 1; i < argc; i++) {
+            // Stop at -- separator: args after -- are per-model presets, handled by load_from_args
+            if (std::string(argv[i]) == "--") {
+                break;
+            }
+
             const std::string arg_prefix = "--";
 
             std::string arg = argv[i];
@@ -484,9 +489,6 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
             }
             if (arg_to_options.find(arg) == arg_to_options.end()) {
                 throw std::invalid_argument(string_format("error: invalid argument: %s", arg.c_str()));
-            }
-            if (!seen_args.insert(arg).second) {
-                LOG_WRN("DEPRECATED: argument '%s' specified multiple times, use comma-separated values instead (only last value will be used)\n", arg.c_str());
             }
             auto & tmp = arg_to_options[arg];
             auto opt = *tmp.first;
@@ -532,6 +534,64 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         }
     };
 
+    // Same as parse_cli_args but skips duplicate-argument warnings (for re-parse after remote preset)
+    auto parse_cli_args_no_warn = [&]() {
+        for (int i = 1; i < argc; i++) {
+            if (std::string(argv[i]) == "--") {
+                break;
+            }
+
+            const std::string arg_prefix = "--";
+
+            std::string arg = argv[i];
+            if (arg.compare(0, arg_prefix.size(), arg_prefix) == 0) {
+                std::replace(arg.begin(), arg.end(), '_', '-');
+            }
+            if (arg_to_options.find(arg) == arg_to_options.end()) {
+                throw std::invalid_argument(string_format("error: invalid argument: %s", arg.c_str()));
+            }
+            auto & tmp = arg_to_options[arg];
+            auto opt = *tmp.first;
+            bool is_positive = tmp.second;
+            if (opt.has_value_from_env()) {
+                fprintf(stderr, "warn: %s environment variable is set, but will be overwritten by command line argument %s\n", opt.env, arg.c_str());
+            }
+            try {
+                if (opt.handler_void) {
+                    opt.handler_void(params);
+                    continue;
+                }
+                if (opt.handler_bool) {
+                    opt.handler_bool(params, is_positive);
+                    continue;
+                }
+
+                check_arg(i);
+                std::string val = argv[++i];
+                if (opt.handler_int) {
+                    opt.handler_int(params, std::stoi(val));
+                    continue;
+                }
+                if (opt.handler_string) {
+                    opt.handler_string(params, val);
+                    continue;
+                }
+
+                check_arg(i);
+                std::string val2 = argv[++i];
+                if (opt.handler_str_str) {
+                    opt.handler_str_str(params, val, val2);
+                    continue;
+                }
+            } catch (std::exception & e) {
+                throw std::invalid_argument(string_format(
+                    "error while handling argument \"%s\": %s\n\n"
+                    "usage:\n%s\n\nto show complete usage, run with -h",
+                    arg.c_str(), e.what(), opt.to_string().c_str()));
+            }
+        }
+    };
+
     // parse the first time to get -hf option (used for remote preset)
     parse_cli_args();
 
@@ -555,8 +615,8 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         bool preset_has_hf_repo = preset_hf_repo != cli_hf_repo;
 
         if (has_preset) {
-            // re-parse CLI args to override preset values
-            parse_cli_args();
+            // re-parse CLI args to override preset values (skip duplicate warnings)
+            parse_cli_args_no_warn();
         }
 
         // preserve hf_repo from preset if needed
@@ -821,6 +881,63 @@ static void add_rpc_devices(const std::string & servers) {
     }
 }
 
+// Split argv into base args (before first --) and model-specific args (after each --)
+// Returns: { base_argc, base_argv, vector of {model_argc, model_argv} }
+std::vector<std::pair<int, char **>> split_args_by_separator(int argc, char ** argv) {
+    // First pass: find -- separators and count blocks
+    std::vector<int> separator_indices;
+    for (int i = 1; i < argc; i++) {
+        if (std::string(argv[i]) == "--") {
+            separator_indices.push_back(i);
+        }
+    }
+
+    std::vector<std::pair<int, char **>> blocks;
+
+    if (separator_indices.empty()) {
+        // No separator: everything goes into a single "base" block
+        char ** new_argv = new char *[2];
+        new_argv[0] = argv[0]; // program name
+        new_argv[1] = nullptr;
+        blocks.push_back({1, new_argv});
+        return blocks;
+    }
+
+    // "Before first --" block
+    int base_argc = separator_indices.front(); // argv[0] ... argv[sep_idx-1]
+    if (base_argc > 0) {
+        char ** new_argv = new char *[base_argc + 1];
+        for (int i = 0; i < base_argc; i++) {
+            new_argv[i] = argv[i];
+        }
+        new_argv[base_argc] = nullptr;
+        blocks.push_back({base_argc, new_argv});
+    }
+
+    // Per-block args between separators
+    for (size_t b = 0; b < separator_indices.size(); b++) {
+        int start = separator_indices[b] + 1;
+        int end = (b + 1 < separator_indices.size()) ? separator_indices[b + 1] : argc;
+        int block_argc = end - start;
+        if (block_argc > 0) {
+            char ** new_argv = new char *[block_argc + 1];
+            for (int i = 0; i < block_argc; i++) {
+                new_argv[i] = argv[start + i];
+            }
+            new_argv[block_argc] = nullptr;
+            blocks.push_back({block_argc, new_argv});
+        }
+    }
+
+    return blocks;
+}
+
+void free_split_args_blocks(const std::vector<std::pair<int, char **>> & blocks) {
+    for (const auto & [argc, argv] : blocks) {
+        delete[] argv;
+    }
+}
+
 bool common_params_to_map(int argc, char ** argv, llama_example ex, std::map<common_arg, std::string> & out_map) {
     common_params dummy_params;
     common_params_context ctx_arg = common_params_parser_init(dummy_params, ex, nullptr);
@@ -846,7 +963,18 @@ bool common_params_to_map(int argc, char ** argv, llama_example ex, std::map<com
 
     std::set<std::string> seen_args;
 
-    for (int i = 1; i < argc; i++) {
+    // Determine start index: if argv[0] looks like an option (starts with -), start from 0
+    int start_i = 1;
+    if (argc >= 1 && argv[0][0] == '-') {
+        start_i = 0;
+    }
+
+    for (int i = start_i; i < argc; i++) {
+        // Stop at -- separator: args after -- are per-model presets
+        if (std::string(argv[i]) == "--") {
+            break;
+        }
+
         const std::string arg_prefix = "--";
 
         std::string arg = argv[i];
@@ -2573,7 +2701,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, const std::string & value) {
             params.model_id = value;
         }
-    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_ID"));
     add_opt(common_arg(
         {"--tags"}, "STRING",
         "set model tags, comma-separated (informational, not used for routing)",
@@ -3087,6 +3215,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.models_autoload = value;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MODELS_AUTOLOAD"));
+    add_opt(common_arg(
+        {"--kv-cache-mode"}, "MODE",
+        string_format("KV cache strategy for multi-model support: \"pool\" (pre-allocated per-model, default) or \"realloc\" (reallocate on swap)"),
+        [](common_params & params, const std::string & value) {
+            params.kv_cache_mode = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_KV_CACHE_MODE"));
     add_opt(common_arg(
         {"--jinja"},
         {"--no-jinja"},
