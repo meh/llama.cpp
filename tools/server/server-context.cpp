@@ -710,6 +710,9 @@ private:
     bool sleeping = false;
 
     void destroy() {
+        // Note: sleeping is set to true by handle_sleeping_state after destroy().
+        // unload_current_model() must also set sleeping = true to prevent
+        // the destructor from calling destroy() again (double free).
         spec.reset();
         ctx_dft.reset();
         model_dft.reset();
@@ -1215,6 +1218,7 @@ private:
         }
 
         destroy();
+        sleeping = true;  // prevent destructor from calling destroy() again
         SRV_INF("%s", "model unloaded\n");
     }
 
