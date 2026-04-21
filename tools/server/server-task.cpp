@@ -375,10 +375,31 @@ task_params server_task::params_from_json_cmpl(
         }
     }
 
+    // Handle "response_format" field (OpenAI compatibility)
+    json json_schema_override;
+    if (data.contains("response_format")) {
+        json response_format      = json_value(data, "response_format", json::object());
+        std::string response_type = json_value(response_format, "type", std::string());
+        if (response_type == "json_object") {
+            // Empty JSON schema for strict JSON output
+            if (!data.contains("json_schema") && !data.contains("grammar")) {
+                json_schema_override = json::object();
+            }
+        } else if (response_type == "json_schema") {
+            auto schema_wrapper = json_value(response_format, "json_schema", json::object());
+            auto schema = json_value(schema_wrapper, "schema", json::object());
+            if (!data.contains("json_schema") && !data.contains("grammar")) {
+                json_schema_override = schema;
+            }
+        } else if (!response_type.empty() && response_type != "text") {
+            throw std::invalid_argument("response_format type must be one of \"text\" or \"json_object\", but got: " + response_type);
+        }
+    }
+
     // process "json_schema" and "grammar"
-    if (data.contains("json_schema") && !data.contains("grammar")) {
+    if (json_schema_override.is_object() && !data.contains("grammar")) {
         try {
-            auto schema                  = json_value(data, "json_schema", json::object());
+            auto schema                  = json_schema_override;
             SRV_DBG("JSON schema: %s\n", schema.dump(2).c_str());
             std::string grammar_str      = json_schema_to_grammar(schema);
             SRV_DBG("Converted grammar: %s\n", grammar_str.c_str());
