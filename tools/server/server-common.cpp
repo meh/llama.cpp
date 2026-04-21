@@ -13,6 +13,13 @@
 #include <sstream>
 #include <fstream>
 
+#if defined(_WIN32)
+#include <windows.h>
+#else
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
+
 json format_error_response(const std::string & message, const enum error_type type) {
     std::string type_str;
     int code = 500;
@@ -1583,4 +1590,85 @@ server_tokens format_prompt_rerank(
     }
 
     return result;
+}
+
+//
+// Model cache: fill the OS page cache for a GGUF file so model swapping is fast
+//
+
+static bool cache_model_file_impl(const std::string & path) {
+    FILE * file = ggml_fopen(path.c_str(), "rb");
+    if (!file) {
+        SRV_WRN("failed to open GGUF file '%s' for caching: %s\n", path.c_str(), strerror(errno));
+        return false;
+    }
+
+    // Get file size
+    fseek(file, 0, SEEK_END);
+    size_t file_size = (size_t)ftell(file);
+    fseek(file, 0, SEEK_SET);
+
+    if (file_size == 0) {
+        SRV_WRN("GGUF file '%s' is empty\n", path.c_str());
+        fclose(file);
+        return false;
+    }
+
+    SRV_INF("caching GGUF file '%s' (%zu MiB)\n", path.c_str(), file_size / (1024 * 1024));
+
+#if defined(_WIN32)
+    {
+        HANDLE hFile = (HANDLE)_get_osfhandle(_fileno(file));
+        HANDLE hMapping = CreateFileMappingA(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
+        if (hMapping) {
+            void * addr = MapViewOfFile(hMapping, FILE_MAP_READ, 0, 0, 0);
+            if (addr) {
+                // Use PrefetchVirtualMemory on Windows (Vista+)
+#if _WIN32_WINNT >= 0x602
+                BOOL (WINAPI *pPrefetchVirtualMemory)(HANDLE, ULONG_PTR, PWIN32_MEMORY_RANGE_ENTRY, ULONG) = nullptr;
+                HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
+                if (hKernel32) {
+                    pPrefetchVirtualMemory = (decltype(pPrefetchVirtualMemory))(void *)GetProcAddress(hKernel32, "PrefetchVirtualMemory");
+                }
+                if (pPrefetchVirtualMemory) {
+                    WIN32_MEMORY_RANGE_ENTRY range;
+                    range.VirtualAddress = addr;
+                    range.NumberOfBytes = (SIZE_T)std::min(file_size, (size_t)4ULL * 1024 * 1024 * 1024); // cap at 4 GiB
+                    pPrefetchVirtualMemory(GetCurrentProcess(), 1, &range, 0);
+                }
+#endif
+                UnmapViewOfFile(addr);
+            }
+            CloseHandle(hMapping);
+        }
+    }
+#else
+    {
+        int fd = fileno(file);
+        // mmap the file
+        void * addr = mmap(NULL, file_size, PROT_READ, MAP_SHARED, fd, 0);
+        if (addr != MAP_FAILED) {
+#ifdef __linux__
+            // On Linux, use MAP_POPULATE to eagerly read pages
+            munmap(addr, file_size);
+            addr = mmap(NULL, file_size, PROT_READ, MAP_SHARED | MAP_POPULATE, fd, 0);
+#endif
+            if (addr != MAP_FAILED) {
+                // madvise(POSIX_MADV_WILLNEED) to tell the kernel we want these pages
+#ifdef POSIX_MADV_WILLNEED
+                madvise(addr, file_size, POSIX_MADV_WILLNEED);
+#endif
+                munmap(addr, file_size);
+            }
+        }
+    }
+#endif
+
+    fclose(file);
+    SRV_INF("caching GGUF file '%s' done\n", path.c_str());
+    return true;
+}
+
+bool cache_model_file(const std::string & path) {
+    return cache_model_file_impl(path);
 }
