@@ -293,6 +293,7 @@ struct common_params_model {
     std::string hf_file     = ""; // HF file                                                // NOLINT
     std::string docker_repo = ""; // Docker repo                                            // NOLINT
     std::string name        = ""; // in format <user>/<model>[:<tag>] (tag is optional)     // NOLINT
+    bool cache              = false; // cache GGUF file in page cache on startup             // NOLINT
 };
 
 struct common_ngram_mod;
@@ -612,6 +613,7 @@ struct common_params {
     int models_max = 4;             // maximum number of models to load simultaneously
     bool models_autoload = true;    // automatically load models when requested via the router server
     std::string kv_cache_mode = "pool"; // KV cache strategy for multi-model: "pool" or "realloc"
+    std::string models_cache = "";  // cache GGUF files in page cache on startup (comma-separated names; empty = all)
 
     bool log_json = false;
 

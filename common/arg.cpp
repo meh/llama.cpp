@@ -3216,6 +3216,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MODELS_AUTOLOAD"));
     add_opt(common_arg(
+        {"--models-cache"},
+        "for server, cache these model GGUF files in page cache on startup. "
+        "If no argument is given, cache all models.",
+        [](common_params & params) {
+            // No argument: cache all models (empty string)
+            params.models_cache = "";
+            // Also check env var in case it was set
+            const char * env_val = std::getenv("LLAMA_ARG_MODELS_CACHE");
+            if (env_val != nullptr) {
+                params.models_cache = env_val;
+            }
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MODELS_CACHE"));
+    add_opt(common_arg(
         {"--kv-cache-mode"}, "MODE",
         string_format("KV cache strategy for multi-model support: \"pool\" (pre-allocated per-model, default) or \"realloc\" (reallocate on swap)"),
         [](common_params & params, const std::string & value) {
@@ -4071,6 +4085,12 @@ void common_params_add_preset_options(std::vector<common_arg> & args) {
         "in server router mode, force-kill model instance after this many seconds of graceful shutdown",
         [](common_params &, int) { /* unused */ }
     ).set_env(COMMON_ARG_PRESET_STOP_TIMEOUT).set_preset_only());
+
+    args.push_back(common_arg(
+        {"cache-on-startup"}, "NAME",
+        "cache this model's GGUF file in page cache on startup (for fast swapping)",
+        [](common_params &, const std::string &) { /* unused */ }
+    ).set_env(COMMON_ARG_PRESET_CACHE_ON_STARTUP).set_preset_only());
 
     // args.push_back(common_arg(
     //     {"pin"},

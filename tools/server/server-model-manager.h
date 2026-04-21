@@ -33,6 +33,7 @@ struct server_model_info {
     server_model_status status = SERVER_MODEL_STATUS_UNLOADED;
     int64_t last_used = 0;      // for LRU eviction (milliseconds since epoch)
     int exit_code = 0;          // exit code if failed
+    bool cached = false;        // GGUF file is cached in page cache for fast swapping
 
     bool is_ready() const {
         return status == SERVER_MODEL_STATUS_LOADED;
@@ -91,6 +92,12 @@ public:
 
     // Wait until a model finishes loading (thread-safe)
     void wait_until_loading_finished(const std::string& name);
+
+    // Cache a model's GGUF file in page cache (for fast swapping)
+    void cache(const std::string& name);
+
+    // Cache all models' GGUF files in page cache
+    void cache_all();
 
 private:
     // Find the LRU model name (must be called with mutex_ held)

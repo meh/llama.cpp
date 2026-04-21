@@ -182,6 +182,7 @@ int main(int argc, char ** argv) {
 
         ctx_http.post("/models/load",          ex_wrapper(models_routes->post_router_models_load));
         ctx_http.post("/models/unload",        ex_wrapper(models_routes->post_router_models_unload));
+        ctx_http.post("/models/cache",         ex_wrapper(models_routes->post_router_models_cache));
     }
 
     ctx_http.get ("/health",                   ex_wrapper(routes.get_health)); // public endpoint (no API key check)
@@ -560,6 +561,46 @@ int main(int argc, char ** argv) {
             }
         }
 
+        // Cache models on startup (both CLI preset and non-CLI preset branches share this logic)
+        if (model_manager) {
+            if (params.models_cache.empty()) {
+                // No argument: cache all models
+                SRV_INF("%s", "caching all model GGUF files in page cache");
+                model_manager->cache_all();
+            } else {
+                // Comma-separated list: cache only specified models
+                std::vector<std::string> cache_names;
+                for (auto & name : string_split<std::string>(params.models_cache, ',')) {
+                    name = string_strip(name);
+                    if (!name.empty()) {
+                        cache_names.push_back(name);
+                    }
+                }
+                if (!cache_names.empty()) {
+                    for (const auto & name : cache_names) {
+                        SRV_INF("caching model '%s'\n", name.c_str());
+                        model_manager->cache(name);
+                    }
+                }
+            }
+            // Also cache models with cache-on-startup preset
+            for (const auto & info : model_manager->get_all_meta()) {
+                if (!info.cached && !info.model_path.empty()) {
+                    // Check if this model has cache-on-startup set
+                    auto preset_it = cli_preset_map.find(info.name);
+                    if (preset_it != cli_preset_map.end()) {
+                        std::string val;
+                        if (preset_it->second->get_option(COMMON_ARG_PRESET_CACHE_ON_STARTUP, val)) {
+                            if (common_arg_utils::is_truthy(val)) {
+                                SRV_INF("caching model '%s' (cache-on-startup preset)\n", info.name.c_str());
+                                model_manager->cache(info.name);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Create model manager if multi-model mode is enabled (non-CLI -- case)
         if (multi_model_enabled && !cli_has_model_presets) {
             model_manager = std::make_unique<server_model_manager>(params.models_max, params.models_autoload);
@@ -712,6 +753,43 @@ int main(int argc, char ** argv) {
                 }
             }
 
+            // Cache models on startup
+            if (params.models_cache.empty()) {
+                // No argument: cache all models
+                SRV_INF("%s", "caching all model GGUF files in page cache");
+                model_manager->cache_all();
+            } else {
+                // Comma-separated list: cache only specified models
+                std::vector<std::string> cache_names;
+                for (auto & name : string_split<std::string>(params.models_cache, ',')) {
+                    name = string_strip(name);
+                    if (!name.empty()) {
+                        cache_names.push_back(name);
+                    }
+                }
+                if (!cache_names.empty()) {
+                    for (const auto & name : cache_names) {
+                        SRV_INF("caching model '%s'\n", name.c_str());
+                        model_manager->cache(name);
+                    }
+                }
+            }
+            // Also cache models with cache-on-startup preset
+            for (const auto & info : model_manager->get_all_meta()) {
+                if (!info.cached && !info.model_path.empty()) {
+                    auto preset_it = final_presets.find(info.name);
+                    if (preset_it != final_presets.end()) {
+                        std::string val;
+                        if (preset_it->second.get_option(COMMON_ARG_PRESET_CACHE_ON_STARTUP, val)) {
+                            if (common_arg_utils::is_truthy(val)) {
+                                SRV_INF("caching model '%s' (cache-on-startup preset)\n", info.name.c_str());
+                                model_manager->cache(info.name);
+                            }
+                        }
+                    }
+                }
+            }
+
             // Wire up model_manager pointer to routes
             routes.set_model_manager(model_manager.get());
 
@@ -792,6 +870,28 @@ int main(int argc, char ** argv) {
                 return res;
             }));
 
+            ctx_http.post("/models/cache", ex_wrapper([model_mgr3 = model_manager.get()](const server_http_req & req) -> server_http_res_ptr {
+                auto res = std::make_unique<server_http_res>();
+                json body = json::parse(req.body);
+                std::string name = json_value(body, "model", std::string());
+
+                if (name.empty()) {
+                    res->status = 400;
+                    res->data = safe_json_to_str({{"error", format_error_response("model name is required", ERROR_TYPE_INVALID_REQUEST)}});
+                    return res;
+                }
+
+                if (!model_mgr3->has_model(name)) {
+                    res->status = 404;
+                    res->data = safe_json_to_str({{"error", format_error_response("model not found", ERROR_TYPE_NOT_FOUND)}});
+                    return res;
+                }
+
+                model_mgr3->cache(name);
+                res_ok(res, {{"success", true}});
+                return res;
+            }));
+
             // Update /models endpoint for multi-model listing
             routes.get_models = ex_wrapper([model_mgr = model_manager.get(), &routes](const server_http_req & req) -> server_http_res_ptr {
                 auto res = std::make_unique<server_http_res>();
@@ -805,6 +905,7 @@ int main(int argc, char ** argv) {
                     for (const auto & info : all_models) {
                         json status {
                             {"value", server_model_status_to_string(info.status)},
+                            {"cached", info.cached},
                         };
                         if (info.status == SERVER_MODEL_STATUS_LOADED) {
                             status["args"] = {{"-m", info.model_path}};
