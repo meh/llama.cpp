@@ -66,7 +66,8 @@ struct server_model_meta {
     json loaded_info; // info to be reflected via /v1/models endpoint
     int exit_code = 0; // exit code of the model instance process (only valid if status == FAILED)
     int stop_timeout = 0; // seconds to wait before force-killing the model instance during shutdown
-    mtmd_caps multimodal; // multimodal capabilities
+    mtmd_caps multimodal;  // multimodal capabilities
+    bool cached = false;   // GGUF file is cached in page cache for fast swapping
 
     bool is_ready() const {
         return status == SERVER_MODEL_STATUS_LOADED;
@@ -147,6 +148,11 @@ public:
     void unload(const std::string & name);
     void unload_all();
 
+    // cache a model's GGUF file in page cache (for fast swapping)
+    // these functions are thread-safe
+    void cache(const std::string & name);
+    void cache_all();
+
     // update the status of a model instance (thread-safe)
     void update_status(const std::string & name, server_model_status status, int exit_code);
     void update_loaded_info(const std::string & name, std::string & raw_info);
@@ -206,6 +212,7 @@ struct server_models_routes {
     server_http_context::handler_t get_router_models;
     server_http_context::handler_t post_router_models_load;
     server_http_context::handler_t post_router_models_unload;
+    server_http_context::handler_t post_router_models_cache;
 };
 
 /**

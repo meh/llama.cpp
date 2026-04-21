@@ -270,6 +270,48 @@ void server_model_manager::wait_until_loading_finished(const std::string& name) 
     });
 }
 
+void server_model_manager::cache(const std::string& name) {
+    std::string canonical = resolve_model_name(name);
+    if (canonical.empty()) {
+        SRV_WRN("model '%s' not found, skipping cache\n", name.c_str());
+        return;
+    }
+
+    std::lock_guard<std::mutex> lk(mutex_);
+    auto& info = mapping_[canonical];
+    if (info.model_path.empty()) {
+        SRV_WRN("model '%s' has no model path, skipping cache\n", canonical.c_str());
+        return;
+    }
+    if (info.cached) {
+        SRV_INF("model '%s' already cached\n", canonical.c_str());
+        return;
+    }
+
+    SRV_INF("caching model '%s' (path: %s)\n", canonical.c_str(), info.model_path.c_str());
+    info.cached = cache_model_file(info.model_path);
+    if (info.cached) {
+        SRV_INF("model '%s' cached successfully\n", canonical.c_str());
+    } else {
+        SRV_WRN("failed to cache model '%s'\n", canonical.c_str());
+    }
+}
+
+void server_model_manager::cache_all() {
+    std::vector<std::string> names;
+    {
+        std::lock_guard<std::mutex> lk(mutex_);
+        for (const auto& [name, info] : mapping_) {
+            if (!name.empty() && !info.model_path.empty() && !info.cached) {
+                names.push_back(name);
+            }
+        }
+    }
+    for (const auto& name : names) {
+        cache(name);
+    }
+}
+
 void server_model_manager::unload_lru(server_context& ctx) {
     std::string lru = find_lru_model();
     if (!lru.empty()) {
