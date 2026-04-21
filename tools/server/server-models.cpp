@@ -766,6 +766,65 @@ void server_models::unload_all() {
     }
 }
 
+void server_models::cache(const std::string & name) {
+    std::lock_guard<std::mutex> lk(mutex);
+    auto it = mapping.find(name);
+    if (it == mapping.end()) {
+        // Also check aliases
+        bool found = false;
+        for (const auto & [key, inst] : mapping) {
+            if (inst.meta.aliases.count(name)) {
+                it = mapping.find(key);
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            SRV_WRN("model '%s' not found, skipping cache\n", name.c_str());
+            return;
+        }
+    }
+
+    auto & meta = it->second.meta;
+    if (meta.cached) {
+        SRV_INF("model '%s' already cached\n", meta.name.c_str());
+        return;
+    }
+
+    std::string model_path;
+    meta.preset.get_option("LLAMA_ARG_MODEL", model_path);
+    if (model_path.empty()) {
+        meta.preset.get_option("-m", model_path);
+    }
+    if (model_path.empty()) {
+        SRV_WRN("model '%s' has no model path, skipping cache\n", meta.name.c_str());
+        return;
+    }
+
+    SRV_INF("caching model '%s' (path: %s)\n", meta.name.c_str(), model_path.c_str());
+    meta.cached = cache_model_file(model_path);
+    if (meta.cached) {
+        SRV_INF("model '%s' cached successfully\n", meta.name.c_str());
+    } else {
+        SRV_WRN("failed to cache model '%s'\n", meta.name.c_str());
+    }
+}
+
+void server_models::cache_all() {
+    std::vector<std::string> names;
+    {
+        std::lock_guard<std::mutex> lk(mutex);
+        for (const auto & [name, inst] : mapping) {
+            if (!name.empty() && !inst.meta.cached) {
+                names.push_back(name);
+            }
+        }
+    }
+    for (const auto & name : names) {
+        cache(name);
+    }
+}
+
 void server_models::update_status(const std::string & name, server_model_status status, int exit_code) {
     std::unique_lock<std::mutex> lk(mutex);
     auto it = mapping.find(name);
@@ -1018,6 +1077,7 @@ void server_models_routes::init_routes() {
             json status {
                 {"value",  server_model_status_to_string(meta.status)},
                 {"args",   meta.args},
+                {"cached", meta.cached},
             };
             if (!meta.preset.name.empty()) {
                 common_preset preset_copy = meta.preset;
@@ -1047,6 +1107,26 @@ void server_models_routes::init_routes() {
             {"data", models_json},
             {"object", "list"},
         });
+        return res;
+    };
+
+    this->post_router_models_cache = [this](const server_http_req & req) {
+        auto res = std::make_unique<server_http_res>();
+        json body = json::parse(req.body);
+        std::string name = json_value(body, "model", std::string());
+
+        if (name.empty()) {
+            res_err(res, format_error_response("model name is required", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+
+        if (!models.has_model(name)) {
+            res_err(res, format_error_response("model not found", ERROR_TYPE_NOT_FOUND));
+            return res;
+        }
+
+        models.cache(name);
+        res_ok(res, {{"success", true}});
         return res;
     };
 

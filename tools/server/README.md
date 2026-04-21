@@ -217,6 +217,7 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--models-preset PATH` | path to INI file containing model presets for the router server (default: disabled)<br/>(env: LLAMA_ARG_MODELS_PRESET) |
 | `--models-max N` | for router server, maximum number of models to load simultaneously (default: 4, 0 = unlimited)<br/>(env: LLAMA_ARG_MODELS_MAX) |
 | `--models-autoload, --no-models-autoload` | for router server, whether to automatically load models (default: enabled)<br/>(env: LLAMA_ARG_MODELS_AUTOLOAD) |
+| `--models-cache [LIST]` | cache GGUF files in page cache for fast model swapping (non-router mode). No argument: cache all models. Comma-separated list: cache only specified models.<br/>(env: LLAMA_ARG_MODELS_CACHE) |
 | `--jinja, --no-jinja` | whether to use jinja template engine for chat (default: enabled)<br/>(env: LLAMA_ARG_JINJA) |
 | `--reasoning-format FORMAT` | controls whether thought tags are allowed and/or extracted from the response, and in which format they're returned; one of:<br/>- none: leaves thoughts unparsed in `message.content`<br/>- deepseek: puts thoughts in `message.reasoning_content`<br/>- deepseek-legacy: keeps `<think>` tags in `message.content` while also populating `message.reasoning_content`<br/>(default: auto)<br/>(env: LLAMA_ARG_THINK) |
 | `-rea, --reasoning [on\|off\|auto]` | Use reasoning/thinking in the chat ('on', 'off', or 'auto', default: 'auto' (detect from template))<br/>(env: LLAMA_ARG_REASONING) |
@@ -1574,6 +1575,7 @@ The precedence rule for preset options is as follows:
 
 We also offer additional options that are exclusive to presets (these aren't treated as command-line arguments):
 - `load-on-startup` (boolean): Controls whether the model loads automatically when the server starts
+- `cache-on-startup` (boolean): Controls whether the model's GGUF file is cached in page cache on startup
 - `stop-timeout` (int, seconds): After requested unload, wait for this many seconds before forcing termination (default: 10)
 
 ### Routing requests
@@ -1702,6 +1704,33 @@ Response:
   "success": true
 }
 ```
+
+### POST `/models/cache`: Cache a model's GGUF file
+
+Cache a model's GGUF file in the OS page cache (RAM) for fast model swapping. This fills the file into the page cache using `mmap` + `madvise(POSIX_MADV_WILLNEED)` (Linux/macOS) or `PrefetchVirtualMemory` (Windows), without loading the model weights into memory.
+
+Payload:
+
+```json
+{
+  "model": "ggml-org/gemma-3-4b-it-GGUF:Q4_K_M"
+}
+```
+
+Response:
+
+```json
+{
+  "success": true
+}
+```
+
+**Notes:**
+- The `cached` field in the `/models` response indicates whether a model's file has been cached in page cache.
+- Use `--models-cache` CLI flag or `cache-on-startup` preset option to cache models automatically on startup.
+- `--models-cache` (no argument): caches all registered models.
+- `--models-cache modelA,modelB`: caches only the specified models.
+- Page cache warming uses `mmap` + `madvise(POSIX_MADV_WILLNEED)` (Linux/macOS) or `PrefetchVirtualMemory` (Windows) — the model weights are not loaded into memory.
 
 ## API errors
 

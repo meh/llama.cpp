@@ -358,6 +358,12 @@ std::string format_oai_resp_sse(const json & data);
 // format Anthropic-style SSE with event types
 std::string format_anthropic_sse(const json & data);
 
+//
+// model cache (page cache fill for fast model swapping)
+//
+
+bool cache_model_file(const std::string & path);
+
 bool is_valid_utf8(const std::string & str);
 
 //
