@@ -168,8 +168,12 @@ server_models::server_models(
         char ** argv)
             : ctx_preset(LLAMA_EXAMPLE_SERVER),
               base_params(params),
-              base_env(get_environment()),
-              base_preset(ctx_preset.load_from_args(argc, argv)) {
+              base_env(get_environment()) {
+    // Parse CLI args into base + per-model presets
+    auto load_result = ctx_preset.load_from_args(argc, argv);
+    base_preset = std::move(load_result.base_preset);
+    model_presets = std::move(load_result.model_presets);
+
     // clean up base preset
     unset_reserved_args(base_preset, true);
     // set binary path
@@ -290,6 +294,21 @@ void server_models::load_models() {
     // server base preset from CLI args take highest precedence
     for (auto & [name, preset] : final_presets) {
         preset.merge(base_preset);
+    }
+
+    // merge base preset into CLI -- separated model presets, then add them
+    // model-specific args override base args, which override preset args
+    for (auto & model_preset : model_presets) {
+        model_preset.merge(base_preset, false);
+        // Use the model path as the preset name if no name is set
+        std::string model_path;
+        model_preset.get_option("LLAMA_ARG_MODEL", model_path);
+        if (model_path.empty()) {
+            model_preset.get_option("-m", model_path);
+        }
+        std::string preset_name = model_path.empty() ? "unnamed_model" : std::filesystem::path(model_path).filename().string();
+        model_preset.name = preset_name;
+        final_presets[preset_name] = std::move(model_preset);
     }
 
     // convert presets to server_model_meta and add to mapping
@@ -881,7 +900,7 @@ void server_models::notify_router_sleeping_state(bool is_sleeping) {
 // server_models_routes
 //
 
-static void res_ok(std::unique_ptr<server_http_res> & res, const json & response_data) {
+void res_ok(std::unique_ptr<server_http_res> & res, const json & response_data) {
     res->status = 200;
     res->data = safe_json_to_str(response_data);
 }

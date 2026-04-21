@@ -4,6 +4,7 @@
 #include "server-http.h"
 #include "server-task.h"
 #include "server-queue.h"
+#include "server-model-manager.h"
 
 #include "build-info.h"
 #include "common.h"
@@ -21,6 +22,7 @@
 #include <memory>
 #include <filesystem>
 #include <utility>
+#include <thread>
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -632,6 +634,7 @@ struct server_metrics {
 
 struct server_context_impl {
     friend struct server_context;
+    friend struct server_routes;
 
 public:
     // only use these pointers outside of this class:
@@ -693,6 +696,8 @@ private:
     std::set<std::string> model_aliases; // additional names for the model
     std::set<std::string> model_tags;    // informational tags
 
+    server_routes * routes_ptr = nullptr; // pointer to routes for swap_task access
+
     bool sleeping = false;
 
     void destroy() {
@@ -746,6 +751,12 @@ private:
         SRV_INF("loading model '%s'\n", params.model.path.c_str());
 
         params_base = params;
+
+        if (params_base.kv_cache_mode == "pool") {
+            SRV_INF("%s", "using KV cache pool mode (pre-allocated per-model)\n");
+        } else {
+            SRV_INF("%s", "using KV cache realloc mode (reallocate on swap)\n");
+        }
 
         llama_init = common_init_from_params(params_base);
 
@@ -953,7 +964,6 @@ private:
             auto model_path = std::filesystem::path(params_base.model.path);
             model_name = model_path.filename().string();
         }
-
         model_aliases = params_base.model_alias;
         model_tags    = params_base.model_tags;
 
@@ -965,6 +975,76 @@ private:
         }
 
         return true;
+    }
+
+    // Swap to a new model: destroy current model, wait for idle, load new model
+    // Returns true on success
+    bool swap_model(const common_params & params) {
+        // First, destroy the current model (if not already destroyed by caller)
+        if (llama_init) {
+            destroy();
+        }
+
+        // Wait for all slots to be idle
+        SRV_INF("%s", "waiting for all slots to be idle before model swap\n");
+        int wait_count = 0;
+        while (true) {
+            bool all_idle = true;
+            for (auto & slot : slots) {
+                if (slot.is_processing()) {
+                    all_idle = false;
+                    break;
+                }
+            }
+            if (all_idle) {
+                SRV_INF("%s", "all slots are idle, proceeding with model swap\n");
+                break;
+            }
+            // Yield to let the main loop process
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            wait_count++;
+            if (wait_count > 10000) { // 100 second timeout
+                SRV_ERR("%s", "timeout waiting for slots to be idle\n");
+                return false;
+            }
+        }
+
+        // Now load the new model
+        if (!load_model(const_cast<common_params &>(params))) {
+            SRV_ERR("%s", "failed to load model after swap\n");
+            return false;
+        }
+
+        return true;
+    }
+
+    // Unload the current model, keeping the context alive
+    void unload_current_model() {
+        // Wait for all slots to be idle
+        SRV_INF("%s", "waiting for all slots to be idle before unloading model\n");
+        int wait_count = 0;
+        while (true) {
+            bool all_idle = true;
+            for (auto & slot : slots) {
+                if (slot.is_processing()) {
+                    all_idle = false;
+                    break;
+                }
+            }
+            if (all_idle) {
+                SRV_INF("%s", "all slots are idle, unloading model\n");
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            wait_count++;
+            if (wait_count > 10000) {
+                SRV_ERR("%s", "timeout waiting for slots to be idle before unload\n");
+                return;
+            }
+        }
+
+        destroy();
+        SRV_INF("%s", "model unloaded\n");
     }
 
     // unlike load_model(), this is only called once during initialization
@@ -2111,6 +2191,34 @@ private:
                     res->id = task.id;
                     queue_results.send(std::move(res));
                 } break;
+            case SERVER_TASK_TYPE_SWAP:
+                {
+                    SRV_INF("swapping model: %s\n", task.swap_params.model.name.c_str());
+
+                    // Destroy current model
+                    routes_ptr->ctx_server_ref.unload_current_model();
+
+                    // Load new model
+                    if (!routes_ptr->ctx_server_ref.load_model(task.swap_params)) {
+                        SRV_ERR("%s", "failed to load new model\n");
+                        auto res = std::make_unique<server_task_result_error>();
+                        res->id = task.id;
+                        res->err_msg = "failed to load new model";
+                        res->err_type = ERROR_TYPE_SERVER;
+                        queue_results.send(std::move(res));
+                        break;
+                    }
+
+                    // Update meta for handlers
+                    if (routes_ptr) {
+                        routes_ptr->update_meta(routes_ptr->get_ctx_server());
+                    }
+
+                    SRV_INF("%s", "model swapped successfully\n");
+                    auto res = std::make_unique<server_task_result_apply_lora>();
+                    res->id = task.id;
+                    queue_results.send(std::move(res));
+                } break;
         }
     }
 
@@ -3069,6 +3177,32 @@ bool server_context::load_model(common_params & params) {
     return impl->load_model(params);
 }
 
+bool server_context::swap_model(const common_params & params) {
+    return impl->swap_model(params);
+}
+
+void server_context::unload_current_model() {
+    impl->unload_current_model();
+}
+
+void server_context::post_swap(const common_params & params) {
+    server_task task(SERVER_TASK_TYPE_SWAP);
+    task.swap_params = params;
+    impl->queue_tasks.post(std::move(task));
+}
+
+bool server_context::has_model_loaded() const {
+    return impl->ctx != nullptr;
+}
+
+std::string server_context::get_current_model_name() const {
+    return impl->model_name;
+}
+
+const server_chat_params& server_context::get_chat_params() const {
+    return impl->chat_params;
+}
+
 void server_context::start_loop() {
     auto & params = impl->params_base;
     impl->queue_tasks.start_loop(params.sleep_idle_seconds * 1000);
@@ -3183,12 +3317,12 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         // process prompt
         std::vector<server_tokens> inputs;
 
-        if (res_type != TASK_RESPONSE_TYPE_NONE && ctx_server.mctx != nullptr) {
+        if (res_type != TASK_RESPONSE_TYPE_NONE && ctx_server_impl.mctx != nullptr) {
             // This is the case used by OAI compatible chat path with MTMD. TODO It can be moved to the path below.
-            inputs.push_back(process_mtmd_prompt(ctx_server.mctx, prompt.get<std::string>(), files));
+            inputs.push_back(process_mtmd_prompt(ctx_server_impl.mctx, prompt.get<std::string>(), files));
         } else {
             // Everything else, including multimodal completions.
-            inputs = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, prompt, true, true);
+            inputs = tokenize_input_prompts(ctx_server_impl.vocab, ctx_server_impl.mctx, prompt, true, true);
         }
 
         // tasks.reserve(inputs.size()); // TODO: this is inaccurate due to child tasks
@@ -3200,7 +3334,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
 
             task.tokens = std::move(inputs[i]);
             task.params = server_task::params_from_json_cmpl(
-                    ctx_server.vocab,
+                    ctx_server_impl.vocab,
                     params,
                     meta->slot_n_ctx,
                     meta->logit_bias_eog,
@@ -3210,7 +3344,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             // OAI-compat
             task.params.res_type          = res_type;
             task.params.oaicompat_cmpl_id = completion_id;
-            task.params.oaicompat_model   = meta->model_name;
+            task.params.oaicompat_model   = json_value(data, "model", meta->model_name);
 
             // prepare child tasks
             if (task.params.n_cmpl > 1) {
@@ -3386,17 +3520,75 @@ std::unique_ptr<server_res_generator> server_routes::create_response(bool bypass
     return std::make_unique<server_res_generator>(queue_tasks, queue_results, params.sleep_idle_seconds, bypass_sleep);
 }
 
-server_routes::server_routes(const common_params & params, server_context & ctx_server)
+server_routes::server_routes(const common_params & params, server_context & ctx_server, server_model_manager * model_manager)
         : params(params),
-          ctx_server(*ctx_server.impl),
+          ctx_server_impl(*ctx_server.impl),
+          ctx_server_ref(ctx_server),
+          model_manager(model_manager),
           queue_tasks(ctx_server.impl->queue_tasks),
           queue_results(ctx_server.impl->queue_results) {
+    ctx_server.impl->routes_ptr = this;
     init_routes();
+}
+
+server_context_meta server_routes::get_ctx_meta() const {
+    return ctx_server_ref.get_meta();
+}
+
+// Helper to resolve model from request and ensure it's loaded
+// Returns nullptr on error (response already set), or the resolved model name
+static std::string resolve_model_from_request(
+        const json & body,
+        server_model_manager * model_manager,
+        const std::string & fallback_model_name,
+        std::unique_ptr<server_http_res> & error_res) {
+    std::string model_name = json_value(body, "model", std::string());
+
+    if (model_name.empty()) {
+        // No model specified, use fallback
+        return fallback_model_name;
+    }
+
+    if (model_manager) {
+        // Multi-model mode: resolve and ensure loaded
+        if (!model_manager->has_model(model_name)) {
+            error_res->status = 404;
+            error_res->data = safe_json_to_str({{"error", format_error_response(
+                string_format("model '%s' not found", model_name.c_str()), ERROR_TYPE_NOT_FOUND)}});
+            return "";
+        }
+
+        // Check if model is loaded, if not try to load
+        auto meta = model_manager->get_meta(model_name);
+        if (!meta.has_value() || !meta->is_ready()) {
+            // Model exists but not loaded - try to load
+            // The actual loading happens in the handler via ensure_model_ready
+        }
+
+        return model_manager->get_meta(model_name)->name;
+    } else {
+        // Single model mode: ignore model field
+        return fallback_model_name;
+    }
 }
 
 void server_routes::init_routes() {
     // IMPORTANT: all lambda functions must start with create_response()
     // this is to ensure that the server_res_generator can handle sleeping case correctly
+
+    // Helper: swap to a model if different from current
+    swap_if_needed_fn = [this](const std::string & requested_model) {
+        if (requested_model.empty() || !model_manager) return;
+        std::string cur = ctx_server_ref.get_current_model_name();
+        if (requested_model == cur) return;
+        auto meta_resolved = model_manager->get_meta(requested_model);
+        if (!meta_resolved.has_value()) return;
+        common_params swap_params = params;
+        swap_params.model.path = meta_resolved->model_path;
+        SRV_INF("swapping to model '%s' (path: %s)\n", requested_model.c_str(), swap_params.model.path.c_str());
+        ctx_server_ref.swap_model(swap_params);
+        meta = std::make_unique<server_context_meta>(get_ctx_meta());
+    };
 
     this->get_health = [this](const server_http_req &) {
         // error and loading states are handled by middleware
@@ -3655,15 +3847,39 @@ void server_routes::init_routes() {
 
     this->post_infill = [this](const server_http_req & req) {
         auto res = create_response();
+
+        // Model selection for multi-model mode
+        std::string requested_model;
+        if (model_manager) {
+            json body = json::parse(req.body);
+            std::string model_name = json_value(body, "model", std::string());
+            if (!model_name.empty()) {
+                if (!model_manager->has_model(model_name)) {
+                    res->status = 404;
+                    res->data = safe_json_to_str({{"error", format_error_response(
+                        string_format("model '%s' not found", model_name.c_str()), ERROR_TYPE_NOT_FOUND)}});
+                    return res;
+                }
+                auto meta_resolved = model_manager->get_meta(model_name);
+                if (meta_resolved.has_value()) {
+                    requested_model = meta_resolved->name;
+                    meta = std::make_unique<server_context_meta>(get_ctx_meta());
+                }
+            }
+        }
+
+        // Swap to the requested model if different from the currently loaded one
+        swap_if_needed_fn(requested_model);
+
         // check model compatibility
         std::string err;
-        if (llama_vocab_fim_pre(ctx_server.vocab) == LLAMA_TOKEN_NULL) {
+        if (llama_vocab_fim_pre(ctx_server_impl.vocab) == LLAMA_TOKEN_NULL) {
             err += "prefix token is missing. ";
         }
-        if (llama_vocab_fim_suf(ctx_server.vocab) == LLAMA_TOKEN_NULL) {
+        if (llama_vocab_fim_suf(ctx_server_impl.vocab) == LLAMA_TOKEN_NULL) {
             err += "suffix token is missing. ";
         }
-        if (llama_vocab_fim_mid(ctx_server.vocab) == LLAMA_TOKEN_NULL) {
+        if (llama_vocab_fim_mid(ctx_server_impl.vocab) == LLAMA_TOKEN_NULL) {
             err += "middle token is missing. ";
         }
         if (!err.empty()) {
@@ -3708,10 +3924,10 @@ void server_routes::init_routes() {
         data["input_extra"] = input_extra; // default to empty array if it's not exist
 
         std::string prompt = json_value(data, "prompt", std::string());
-        std::vector<server_tokens> tokenized_prompts = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, prompt, false, true);
+        std::vector<server_tokens> tokenized_prompts = tokenize_input_prompts(ctx_server_impl.vocab, ctx_server_impl.mctx, prompt, false, true);
         SRV_DBG("creating infill tasks, n_prompts = %d\n", (int) tokenized_prompts.size());
         data["prompt"] = format_prompt_infill(
-            ctx_server.vocab,
+            ctx_server_impl.vocab,
             data.at("input_prefix"),
             data.at("input_suffix"),
             data.at("input_extra"),
@@ -3734,7 +3950,36 @@ void server_routes::init_routes() {
     this->post_completions = [this](const server_http_req & req) {
         auto res = create_response();
         std::vector<raw_buffer> files; // dummy
-        const json body = json::parse(req.body);
+        json body = json::parse(req.body);
+
+        // Ensure body["model"] is set (for OAI-compat response)
+        if (!body.contains("model")) {
+            body["model"] = meta->model_name;
+        }
+
+        // Model selection for multi-model mode
+        std::string requested_model;
+        if (model_manager) {
+            std::string model_name = json_value(body, "model", std::string());
+            if (!model_name.empty()) {
+                if (!model_manager->has_model(model_name)) {
+                    res->status = 404;
+                    res->data = safe_json_to_str({{"error", format_error_response(
+                        string_format("model '%s' not found", model_name.c_str()), ERROR_TYPE_NOT_FOUND)}});
+                    return res;
+                }
+                auto meta_resolved = model_manager->get_meta(model_name);
+                if (meta_resolved.has_value()) {
+                    body["model"] = meta_resolved->name;
+                    requested_model = meta_resolved->name;
+                    meta = std::make_unique<server_context_meta>(get_ctx_meta());
+                }
+            }
+        }
+
+        // Swap to the requested model if different from the currently loaded one
+        swap_if_needed_fn(requested_model);
+
         return handle_completions_impl(
             req,
             SERVER_TASK_TYPE_COMPLETION,
@@ -3746,7 +3991,37 @@ void server_routes::init_routes() {
     this->post_completions_oai = [this](const server_http_req & req) {
         auto res = create_response();
         std::vector<raw_buffer> files; // dummy
-        const json body = json::parse(req.body);
+        json body = json::parse(req.body);
+
+        // Ensure body["model"] is set (for OAI-compat response)
+        if (!body.contains("model")) {
+            body["model"] = meta->model_name;
+        }
+
+        // Model selection for multi-model mode
+        std::string requested_model;
+        if (model_manager) {
+            std::string model_name = json_value(body, "model", std::string());
+            if (!model_name.empty()) {
+                if (!model_manager->has_model(model_name)) {
+                    res->status = 404;
+                    res->data = safe_json_to_str({{"error", format_error_response(
+                        string_format("model '%s' not found", model_name.c_str()), ERROR_TYPE_NOT_FOUND)}});
+                    return res;
+                }
+                auto meta_resolved = model_manager->get_meta(model_name);
+                if (meta_resolved.has_value()) {
+                    body["model"] = meta_resolved->name;
+                    requested_model = meta_resolved->name;
+                    // Update meta to reflect the resolved model
+                    meta = std::make_unique<server_context_meta>(get_ctx_meta());
+                }
+            }
+        }
+
+        // Swap to the requested model if different from the currently loaded one
+        swap_if_needed_fn(requested_model);
+
         return handle_completions_impl(
             req,
             SERVER_TASK_TYPE_COMPLETION,
@@ -3759,6 +4034,36 @@ void server_routes::init_routes() {
         auto res = create_response();
         std::vector<raw_buffer> files;
         json body = json::parse(req.body);
+
+        // Ensure body["model"] is set (for OAI-compat response)
+        if (!body.contains("model")) {
+            body["model"] = meta->model_name;
+        }
+
+        // Model selection for multi-model mode
+        std::string requested_model;
+        if (model_manager) {
+            std::string model_name = json_value(body, "model", std::string());
+            if (!model_name.empty()) {
+                if (!model_manager->has_model(model_name)) {
+                    res->status = 404;
+                    res->data = safe_json_to_str({{"error", format_error_response(
+                        string_format("model '%s' not found", model_name.c_str()), ERROR_TYPE_NOT_FOUND)}});
+                    return res;
+                }
+                auto meta_resolved = model_manager->get_meta(model_name);
+                if (meta_resolved.has_value()) {
+                    body["model"] = meta_resolved->name;
+                    requested_model = meta_resolved->name;
+                    // Update meta to reflect the resolved model
+                    meta = std::make_unique<server_context_meta>(get_ctx_meta());
+                }
+            }
+        }
+
+        // Swap to the requested model if different from the currently loaded one
+        swap_if_needed_fn(requested_model);
+
         json body_parsed = oaicompat_chat_params_parse(
             body,
             meta->chat_params,
@@ -3777,6 +4082,35 @@ void server_routes::init_routes() {
         json body = convert_responses_to_chatcmpl(json::parse(req.body));
         SRV_DBG("%s\n", "Request converted: OpenAI Responses -> OpenAI Chat Completions");
         SRV_DBG("converted request: %s\n", body.dump().c_str());
+
+        // Ensure body["model"] is set (for OAI-compat response)
+        if (!body.contains("model")) {
+            body["model"] = meta->model_name;
+        }
+
+        // Model selection for multi-model mode
+        std::string requested_model;
+        if (model_manager) {
+            std::string model_name = json_value(body, "model", std::string());
+            if (!model_name.empty()) {
+                if (!model_manager->has_model(model_name)) {
+                    res->status = 404;
+                    res->data = safe_json_to_str({{"error", format_error_response(
+                        string_format("model '%s' not found", model_name.c_str()), ERROR_TYPE_NOT_FOUND)}});
+                    return res;
+                }
+                auto meta_resolved = model_manager->get_meta(model_name);
+                if (meta_resolved.has_value()) {
+                    body["model"] = meta_resolved->name;
+                    requested_model = meta_resolved->name;
+                    meta = std::make_unique<server_context_meta>(get_ctx_meta());
+                }
+            }
+        }
+
+        // Swap to the requested model if different from the currently loaded one
+        swap_if_needed_fn(requested_model);
+
         json body_parsed = oaicompat_chat_params_parse(
             body,
             meta->chat_params,
@@ -3791,6 +4125,29 @@ void server_routes::init_routes() {
 
     this->post_transcriptions_oai = [this](const server_http_req & req) {
         auto res = create_response();
+
+        // Model selection for multi-model mode
+        std::string requested_model;
+        if (model_manager) {
+            json body = json::parse(req.body);
+            std::string model_name = json_value(body, "model", std::string());
+            if (!model_name.empty()) {
+                if (!model_manager->has_model(model_name)) {
+                    res->status = 404;
+                    res->data = safe_json_to_str({{"error", format_error_response(
+                        string_format("model '%s' not found", model_name.c_str()), ERROR_TYPE_NOT_FOUND)}});
+                    return res;
+                }
+                auto meta_resolved = model_manager->get_meta(model_name);
+                if (meta_resolved.has_value()) {
+                    requested_model = meta_resolved->name;
+                    meta = std::make_unique<server_context_meta>(get_ctx_meta());
+                }
+            }
+        }
+
+        // Swap to the requested model if different from the currently loaded one
+        swap_if_needed_fn(requested_model);
 
         if (!meta->has_mtmd || !meta->chat_params.allow_audio) {
             res->error(format_error_response("The current model does not support audio input.", ERROR_TYPE_NOT_SUPPORTED));
@@ -3822,6 +4179,35 @@ void server_routes::init_routes() {
         json body = convert_anthropic_to_oai(json::parse(req.body));
         SRV_DBG("%s\n", "Request converted: Anthropic -> OpenAI Chat Completions");
         SRV_DBG("converted request: %s\n", body.dump().c_str());
+
+        // Ensure body["model"] is set (for OAI-compat response)
+        if (!body.contains("model")) {
+            body["model"] = meta->model_name;
+        }
+
+        // Model selection for multi-model mode
+        std::string requested_model;
+        if (model_manager) {
+            std::string model_name = json_value(body, "model", std::string());
+            if (!model_name.empty()) {
+                if (!model_manager->has_model(model_name)) {
+                    res->status = 404;
+                    res->data = safe_json_to_str({{"error", format_error_response(
+                        string_format("model '%s' not found", model_name.c_str()), ERROR_TYPE_NOT_FOUND)}});
+                    return res;
+                }
+                auto meta_resolved = model_manager->get_meta(model_name);
+                if (meta_resolved.has_value()) {
+                    body["model"] = meta_resolved->name;
+                    requested_model = meta_resolved->name;
+                    meta = std::make_unique<server_context_meta>(get_ctx_meta());
+                }
+            }
+        }
+
+        // Swap to the requested model if different from the currently loaded one
+        swap_if_needed_fn(requested_model);
+
         json body_parsed = oaicompat_chat_params_parse(
             body,
             meta->chat_params,
@@ -3836,6 +4222,30 @@ void server_routes::init_routes() {
 
     this->post_anthropic_count_tokens = [this](const server_http_req & req) {
         auto res = create_response();
+
+        // Model selection for multi-model mode
+        std::string requested_model;
+        if (model_manager) {
+            json body = json::parse(req.body);
+            std::string model_name = json_value(body, "model", std::string());
+            if (!model_name.empty()) {
+                if (!model_manager->has_model(model_name)) {
+                    res->status = 404;
+                    res->data = safe_json_to_str({{"error", format_error_response(
+                        string_format("model '%s' not found", model_name.c_str()), ERROR_TYPE_NOT_FOUND)}});
+                    return res;
+                }
+                auto meta_resolved = model_manager->get_meta(model_name);
+                if (meta_resolved.has_value()) {
+                    requested_model = meta_resolved->name;
+                    meta = std::make_unique<server_context_meta>(get_ctx_meta());
+                }
+            }
+        }
+
+        // Swap to the requested model if different from the currently loaded one
+        swap_if_needed_fn(requested_model);
+
         std::vector<raw_buffer> files;
         json body = convert_anthropic_to_oai(json::parse(req.body));
         SRV_DBG("%s\n", "Request converted: Anthropic -> OpenAI Chat Completions");
@@ -3846,7 +4256,7 @@ void server_routes::init_routes() {
             files);
 
         json prompt = body_parsed.at("prompt");
-        llama_tokens tokens = tokenize_mixed(ctx_server.vocab, prompt, true, true);
+        llama_tokens tokens = tokenize_mixed(ctx_server_impl.vocab, prompt, true, true);
         res->ok({{"input_tokens", static_cast<int>(tokens.size())}});
         return res;
     };
@@ -3854,6 +4264,30 @@ void server_routes::init_routes() {
     // same with handle_chat_completions, but without inference part
     this->post_apply_template = [this](const server_http_req & req) {
         auto res = create_response();
+
+        // Model selection for multi-model mode
+        std::string requested_model;
+        if (model_manager) {
+            json body = json::parse(req.body);
+            std::string model_name = json_value(body, "model", std::string());
+            if (!model_name.empty()) {
+                if (!model_manager->has_model(model_name)) {
+                    res->status = 404;
+                    res->data = safe_json_to_str({{"error", format_error_response(
+                        string_format("model '%s' not found", model_name.c_str()), ERROR_TYPE_NOT_FOUND)}});
+                    return res;
+                }
+                auto meta_resolved = model_manager->get_meta(model_name);
+                if (meta_resolved.has_value()) {
+                    requested_model = meta_resolved->name;
+                    meta = std::make_unique<server_context_meta>(get_ctx_meta());
+                }
+            }
+        }
+
+        // Swap to the requested model if different from the currently loaded one
+        swap_if_needed_fn(requested_model);
+
         std::vector<raw_buffer> files; // dummy, unused
         json body = json::parse(req.body);
         json data = oaicompat_chat_params_parse(
@@ -3872,6 +4306,60 @@ void server_routes::init_routes() {
         bool ctx_server; // do NOT delete this line
         GGML_UNUSED(ctx_server);
 
+        // Multi-model mode: return all registered models
+        if (model_manager) {
+            json models_list = json::array();
+            json data_list = json::array();
+
+            for (const auto & info : model_manager->get_all_meta()) {
+                json tags_arr = json::array();
+                for (const auto & t : info.tags) tags_arr.push_back(t);
+                json aliases_arr = json::array();
+                for (const auto & a : info.aliases) aliases_arr.push_back(a);
+
+                models_list.push_back({
+                    {"name",  info.name},
+                    {"model", info.name},
+                    {"modified_at", ""},
+                    {"size", ""},
+                    {"digest", ""},
+                    {"type", "model"},
+                    {"description", ""},
+                    {"tags", tags_arr},
+                    {"capabilities", json({"completion"})},
+                    {"parameters", ""},
+                    {"details", {
+                        {"parent_model", ""},
+                        {"format", "gguf"},
+                        {"family", ""},
+                        {"families", json::array()},
+                        {"parameter_size", ""},
+                        {"quantization_level", ""}
+                    }}
+                });
+
+                json data_entry = {
+                    {"id",       info.name},
+                    {"aliases",  aliases_arr},
+                    {"tags",     tags_arr},
+                    {"object",   "model"},
+                    {"created",  std::time(0)},
+                    {"owned_by", "llamacpp"},
+                    {"meta",     {{"status", json(info.status)}}},
+                };
+                data_list.push_back(data_entry);
+            }
+
+            json models = {
+                {"models", models_list},
+                {"object", "list"},
+                {"data", data_list}
+            };
+            res->ok(models);
+            return res;
+        }
+
+        // Single-model mode: return current model
         json models = {
             {"models", {
                 {
@@ -3879,7 +4367,7 @@ void server_routes::init_routes() {
                     {"model", meta->model_name},
                     {"modified_at", ""},
                     {"size", ""},
-                    {"digest", ""}, // dummy value, llama.cpp does not support managing model file's hash
+                    {"digest", ""},
                     {"type", "model"},
                     {"description", ""},
                     {"tags", {""}},
@@ -3922,6 +4410,30 @@ void server_routes::init_routes() {
 
     this->post_tokenize = [this](const server_http_req & req) {
         auto res = create_response();
+
+        // Model selection for multi-model mode
+        std::string requested_model;
+        if (model_manager) {
+            json body = json::parse(req.body);
+            std::string model_name = json_value(body, "model", std::string());
+            if (!model_name.empty()) {
+                if (!model_manager->has_model(model_name)) {
+                    res->status = 404;
+                    res->data = safe_json_to_str({{"error", format_error_response(
+                        string_format("model '%s' not found", model_name.c_str()), ERROR_TYPE_NOT_FOUND)}});
+                    return res;
+                }
+                auto meta_resolved = model_manager->get_meta(model_name);
+                if (meta_resolved.has_value()) {
+                    requested_model = meta_resolved->name;
+                    meta = std::make_unique<server_context_meta>(get_ctx_meta());
+                }
+            }
+        }
+
+        // Swap to the requested model if different from the currently loaded one
+        swap_if_needed_fn(requested_model);
+
         const json body = json::parse(req.body);
         json tokens_response = json::array();
         if (body.count("content") != 0) {
@@ -3929,11 +4441,11 @@ void server_routes::init_routes() {
             const bool parse_special = json_value(body, "parse_special", true);
             const bool with_pieces = json_value(body, "with_pieces", false);
 
-            llama_tokens tokens = tokenize_mixed(ctx_server.vocab, body.at("content"), add_special, parse_special);
+            llama_tokens tokens = tokenize_mixed(ctx_server_impl.vocab, body.at("content"), add_special, parse_special);
 
             if (with_pieces) {
                 for (const auto& token : tokens) {
-                    std::string piece = common_token_to_piece(ctx_server.vocab, token);
+                    std::string piece = common_token_to_piece(ctx_server_impl.vocab, token);
                     json piece_json;
 
                     // Check if the piece is valid UTF-8
@@ -3963,12 +4475,36 @@ void server_routes::init_routes() {
 
     this->post_detokenize = [this](const server_http_req & req) {
         auto res = create_response();
+
+        // Model selection for multi-model mode
+        std::string requested_model;
+        if (model_manager) {
+            json body = json::parse(req.body);
+            std::string model_name = json_value(body, "model", std::string());
+            if (!model_name.empty()) {
+                if (!model_manager->has_model(model_name)) {
+                    res->status = 404;
+                    res->data = safe_json_to_str({{"error", format_error_response(
+                        string_format("model '%s' not found", model_name.c_str()), ERROR_TYPE_NOT_FOUND)}});
+                    return res;
+                }
+                auto meta_resolved = model_manager->get_meta(model_name);
+                if (meta_resolved.has_value()) {
+                    requested_model = meta_resolved->name;
+                    meta = std::make_unique<server_context_meta>(get_ctx_meta());
+                }
+            }
+        }
+
+        // Swap to the requested model if different from the currently loaded one
+        swap_if_needed_fn(requested_model);
+
         const json body = json::parse(req.body);
 
         std::string content;
         if (body.count("tokens") != 0) {
             const llama_tokens tokens = body.at("tokens");
-            content = tokens_to_str(ctx_server.vocab, tokens);
+            content = tokens_to_str(ctx_server_impl.vocab, tokens);
         }
 
         res->ok(json{{"content", std::move(content)}});
@@ -3976,15 +4512,85 @@ void server_routes::init_routes() {
     };
 
     this->post_embeddings = [this](const server_http_req & req) {
+        // Model selection for multi-model mode
+        std::string requested_model;
+        if (model_manager) {
+            auto res = create_response();
+            json body = json::parse(req.body);
+            std::string model_name = json_value(body, "model", std::string());
+            if (!model_name.empty()) {
+                if (!model_manager->has_model(model_name)) {
+                    res->status = 404;
+                    res->data = safe_json_to_str({{"error", format_error_response(
+                        string_format("model '%s' not found", model_name.c_str()), ERROR_TYPE_NOT_FOUND)}});
+                    return res;
+                }
+                auto meta_resolved = model_manager->get_meta(model_name);
+                if (meta_resolved.has_value()) {
+                    requested_model = meta_resolved->name;
+                    meta = std::make_unique<server_context_meta>(get_ctx_meta());
+                }
+            }
+        }
+
+        // Swap to the requested model if different from the currently loaded one
+        swap_if_needed_fn(requested_model);
         return handle_embeddings_impl(req, TASK_RESPONSE_TYPE_NONE);
     };
 
     this->post_embeddings_oai = [this](const server_http_req & req) {
+        // Model selection for multi-model mode
+        std::string requested_model;
+        if (model_manager) {
+            auto res = create_response();
+            json body = json::parse(req.body);
+            std::string model_name = json_value(body, "model", std::string());
+            if (!model_name.empty()) {
+                if (!model_manager->has_model(model_name)) {
+                    res->status = 404;
+                    res->data = safe_json_to_str({{"error", format_error_response(
+                        string_format("model '%s' not found", model_name.c_str()), ERROR_TYPE_NOT_FOUND)}});
+                    return res;
+                }
+                auto meta_resolved = model_manager->get_meta(model_name);
+                if (meta_resolved.has_value()) {
+                    requested_model = meta_resolved->name;
+                    meta = std::make_unique<server_context_meta>(get_ctx_meta());
+                }
+            }
+        }
+
+        // Swap to the requested model if different from the currently loaded one
+        swap_if_needed_fn(requested_model);
         return handle_embeddings_impl(req, TASK_RESPONSE_TYPE_OAI_EMBD);
     };
 
     this->post_rerank = [this](const server_http_req & req) {
         auto res = create_response();
+
+        // Model selection for multi-model mode
+        std::string requested_model;
+        if (model_manager) {
+            json body = json::parse(req.body);
+            std::string model_name = json_value(body, "model", std::string());
+            if (!model_name.empty()) {
+                if (!model_manager->has_model(model_name)) {
+                    res->status = 404;
+                    res->data = safe_json_to_str({{"error", format_error_response(
+                        string_format("model '%s' not found", model_name.c_str()), ERROR_TYPE_NOT_FOUND)}});
+                    return res;
+                }
+                auto meta_resolved = model_manager->get_meta(model_name);
+                if (meta_resolved.has_value()) {
+                    requested_model = meta_resolved->name;
+                    meta = std::make_unique<server_context_meta>(get_ctx_meta());
+                }
+            }
+        }
+
+        // Swap to the requested model if different from the currently loaded one
+        swap_if_needed_fn(requested_model);
+
         if (!params.embedding || params.pooling_type != LLAMA_POOLING_TYPE_RANK) {
             res->error(format_error_response("This server does not support reranking. Start it with `--reranking`", ERROR_TYPE_NOT_SUPPORTED));
             return res;
@@ -4025,7 +4631,7 @@ void server_routes::init_routes() {
             std::vector<server_task> tasks;
             tasks.reserve(documents.size());
             for (size_t i = 0; i < documents.size(); i++) {
-                auto tmp = format_prompt_rerank(ctx_server.model, ctx_server.vocab, ctx_server.mctx, query, documents[i]);
+                auto tmp = format_prompt_rerank(ctx_server_impl.model, ctx_server_impl.vocab, ctx_server_impl.mctx, query, documents[i]);
                 server_task task = server_task(SERVER_TASK_TYPE_RERANK);
                 task.id     = rd.get_new_id();
                 task.tokens = std::move(tmp);
@@ -4263,7 +4869,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_embeddings_impl(cons
         }
     }
 
-    auto tokenized_prompts = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, prompt, true, true);
+    auto tokenized_prompts = tokenize_input_prompts(ctx_server_impl.vocab, ctx_server_impl.mctx, prompt, true, true);
     for (const auto & tokens : tokenized_prompts) {
         // this check is necessary for models that do not add BOS token to the input
         if (tokens.empty()) {

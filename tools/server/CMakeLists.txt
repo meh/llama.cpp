@@ -13,6 +13,8 @@ add_library(${TARGET} STATIC
     server-common.h
     server-context.cpp
     server-context.h
+    server-model-manager.cpp
+    server-model-manager.h
     server-tools.cpp
     server-tools.h
 )
