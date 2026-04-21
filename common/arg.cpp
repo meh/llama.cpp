@@ -2568,6 +2568,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_ALIAS"));
     add_opt(common_arg(
+        {"--id"}, "STRING",
+        "set custom model id (used in API responses like /models)",
+        [](common_params & params, const std::string & value) {
+            params.model_id = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--tags"}, "STRING",
         "set model tags, comma-separated (informational, not used for routing)",
         [](common_params & params, const std::string & value) {

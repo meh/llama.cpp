@@ -453,6 +453,7 @@ struct common_params {
 
     struct common_params_model model;
 
+    std::string model_id;                  // custom model identifier for API responses                      // NOLINT
     std::set<std::string> model_alias;     // model aliases                                                 // NOLINT
     std::set<std::string> model_tags;      // model tags (informational, not used for routing)              // NOLINT
     std::string hf_token             = ""; // HF token                                                      // NOLINT
