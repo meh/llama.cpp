@@ -665,6 +665,18 @@ int main(int argc, char ** argv) {
                 }
             }
 
+            // Register the base model (non-router multi-model mode)
+            if (!model_manager_base_model_name.empty()) {
+                server_model_info base_info;
+                base_info.name = model_manager_base_model_name;
+                base_info.model_path = params.model.path;
+                base_info.aliases = params.model_alias;
+                base_info.tags = params.model_tags;
+                base_info.status = SERVER_MODEL_STATUS_LOADED;
+                base_info.last_used = ggml_time_ms();
+                model_manager->add_model(std::move(base_info));
+            }
+
             // Log available models
             SRV_INF("Available models (%zu)\n", model_manager->get_all_meta().size());
             for (const auto & info : model_manager->get_all_meta()) {
