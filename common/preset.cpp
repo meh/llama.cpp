@@ -157,9 +157,11 @@ bool common_preset::get_option(const std::string & env, std::string & value) con
     return false;
 }
 
-void common_preset::merge(const common_preset & other) {
+void common_preset::merge(const common_preset & other, bool overwrite_existing) {
     for (const auto & [opt, val] : other.options) {
-        options[opt] = val; // overwrite existing options
+        if (overwrite_existing || options.find(opt) == options.end()) {
+            options[opt] = val;
+        }
     }
 }
 
@@ -444,16 +446,38 @@ common_presets common_preset_context::load_from_models_dir(const std::string & m
     return out;
 }
 
-common_preset common_preset_context::load_from_args(int argc, char ** argv) const {
-    common_preset preset;
-    preset.name = COMMON_PRESET_DEFAULT_NAME;
+common_preset_load_result common_preset_context::load_from_args(int argc, char ** argv) const {
+    common_preset_load_result result;
+    result.base_preset.name = COMMON_PRESET_DEFAULT_NAME;
 
-    bool ok = common_params_to_map(argc, argv, ctx_params.ex, preset.options);
-    if (!ok) {
-        throw std::runtime_error("failed to parse CLI arguments into preset");
+    // Split argv by -- separator
+    auto blocks = split_args_by_separator(argc, argv);
+
+    // The first block (if present) is the base preset
+    // Remaining blocks are model-specific presets
+    if (!blocks.empty()) {
+        bool ok = common_params_to_map(blocks[0].first, blocks[0].second, ctx_params.ex, result.base_preset.options);
+        if (!ok) {
+            free_split_args_blocks(blocks);
+            throw std::runtime_error("failed to parse base CLI arguments into preset");
+        }
     }
 
-    return preset;
+    // Process model-specific blocks (after each --)
+    for (size_t i = 1; i < blocks.size(); i++) {
+        common_preset preset;
+        preset.name = "model_" + std::to_string(i - 1);
+
+        bool ok = common_params_to_map(blocks[i].first, blocks[i].second, ctx_params.ex, preset.options);
+        if (!ok) {
+            free_split_args_blocks(blocks);
+            throw std::runtime_error("failed to parse CLI arguments into preset");
+        }
+        result.model_presets.push_back(std::move(preset));
+    }
+
+    free_split_args_blocks(blocks);
+    return result;
 }
 
 common_presets common_preset_context::cascade(const common_presets & base, const common_presets & added) const {
