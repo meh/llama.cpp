@@ -134,3 +134,8 @@ void common_params_handle_models(common_params & params, llama_example curr_ex);
 
 // initialize argument parser context - used by test-arg-parser and preset
 common_params_context common_params_parser_init(common_params & params, llama_example ex, void(*print_usage)(int, char **) = nullptr);
+
+// Split argv by -- separator into base block + per-model blocks
+// Returns vector of {argc, argv} pairs. Caller must free with free_split_args_blocks.
+std::vector<std::pair<int, char **>> split_args_by_separator(int argc, char ** argv);
+void free_split_args_blocks(const std::vector<std::pair<int, char **>> & blocks);
