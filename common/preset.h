@@ -40,7 +40,7 @@ struct common_preset {
     bool get_option(const std::string & env, std::string & value) const;
 
     // merge another preset into this one, overwriting existing options
-    void merge(const common_preset & other);
+    void merge(const common_preset & other, bool overwrite_existing = true);
 
     // apply preset options to common_params
     void apply_to_params(common_params & params) const;
@@ -48,6 +48,14 @@ struct common_preset {
 
 // interface for multiple presets in one file
 using common_presets = std::map<std::string, common_preset>;
+
+// Result of parsing CLI args with -- separator support
+// base_preset contains args before the first --
+// model_presets contains one preset per -- block (each starting with -m / --model)
+struct common_preset_load_result {
+    common_preset base_preset;       // base preset from args before first --
+    std::vector<common_preset> model_presets; // per-model presets (one per -- block)
+};
 
 // context for loading and editing presets
 struct common_preset_context {
@@ -71,8 +79,8 @@ struct common_preset_context {
     // for the directory structure, see "Using multiple models" in server/README.md
     common_presets load_from_models_dir(const std::string & models_dir) const;
 
-    // generate one preset from CLI arguments
-    common_preset load_from_args(int argc, char ** argv) const;
+    // generate base + per-model presets from CLI arguments (supports -- separator)
+    common_preset_load_result load_from_args(int argc, char ** argv) const;
 
     // cascade multiple presets if exist on both: base < added
     // if preset does not exist in base, it will be added without modification
