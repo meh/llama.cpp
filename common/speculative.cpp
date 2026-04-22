@@ -169,6 +169,21 @@ struct common_speculative_checkpoint {
     }
 };
 
+struct common_speculative_checkpoint {
+    llama_pos pos_min  = 0;
+    llama_pos pos_max  = 0;
+
+    int64_t   n_tokens = 0;
+
+    std::vector<uint8_t> data;
+
+    size_t size() const {
+        return data.size();
+    }
+
+    size_t ckpt_size   = 0;
+};
+
 struct common_speculative_state_draft : public common_speculative_state {
     llama_context * ctx_tgt; // only used for retokenizing from ctx_dft
     llama_context * ctx_dft;
@@ -391,6 +406,15 @@ struct common_speculative_state_draft : public common_speculative_state {
                 return;
             }
 
+            bool do_restore = false;
+            if (prompt_dft.size() > prompt_cur.size() && reuse_i + reuse_n < (int64_t) prompt_dft.size()) {
+                // This can happen after a partial acceptance (speculative decoding with checkpoints)
+                LOG_DBG("%s: #prompt_dft=%zu, #prompt_cur=%zu, shorten draft\n",
+                        __func__, prompt_dft.size(), prompt_cur.size());
+                prompt_dft.resize(prompt_cur.size());
+                do_restore = true;
+            }
+
             if (reuse_i > 0) {
                 GGML_ASSERT(!use_ckpt);
 
@@ -421,6 +445,10 @@ struct common_speculative_state_draft : public common_speculative_state {
                     prompt_dft.erase(prompt_dft.begin() + reuse_n, prompt_dft.end());
                 }
             }
+        }
+
+        if (needs_ckpt) {
+            ckpt.ckpt_size = draft_create_checkpoint(prompt_dft.size(), batch.n_tokens);
         }
 
         // prepare a batch to evaluate any new tokens in the prompt
