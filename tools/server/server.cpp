@@ -543,10 +543,18 @@ int main(int argc, char ** argv) {
             }
             SRV_INF("autoload: %zu models to load on startup\n", models_to_load.size());
             if (!models_to_load.empty()) {
-                if ((int)models_to_load.size() > params.models_max) {
-                    SRV_WRN("number of models to load on startup (%zu) exceeds models_max (%d), loading first %d\n",
-                        models_to_load.size(), params.models_max, params.models_max);
-                    models_to_load.resize(params.models_max);
+                // Account for already-loaded models (e.g., the base model loaded via ctx_server.load_model)
+                size_t already_loaded = 0;
+                for (const auto & info : model_manager->get_all_meta()) {
+                    if (info.status == SERVER_MODEL_STATUS_LOADED) {
+                        already_loaded++;
+                    }
+                }
+                if (params.models_max > 0 && (int)(models_to_load.size() + already_loaded) > params.models_max) {
+                    size_t to_keep = params.models_max > (int)already_loaded ? params.models_max - already_loaded : 0;
+                    SRV_WRN("number of models to load on startup (%zu) exceeds models_max (%d), loading first %zu\n",
+                        models_to_load.size(), params.models_max, to_keep);
+                    models_to_load.resize(to_keep);
                 }
                 for (const auto & model_name : models_to_load) {
                     SRV_INF("(startup) loading model %s\n", model_name.c_str());
@@ -736,10 +744,18 @@ int main(int argc, char ** argv) {
                 }
             }
             if (!models_to_load.empty()) {
-                if ((int)models_to_load.size() > params.models_max) {
-                    SRV_WRN("number of models to load on startup (%zu) exceeds models_max (%d), loading first %d\n",
-                        models_to_load.size(), params.models_max, params.models_max);
-                    models_to_load.resize(params.models_max);
+                // Account for already-loaded models (e.g., the base model loaded via ctx_server.load_model)
+                size_t already_loaded = 0;
+                for (const auto & info : model_manager->get_all_meta()) {
+                    if (info.status == SERVER_MODEL_STATUS_LOADED) {
+                        already_loaded++;
+                    }
+                }
+                if (params.models_max > 0 && (int)(models_to_load.size() + already_loaded) > params.models_max) {
+                    size_t to_keep = params.models_max > (int)already_loaded ? params.models_max - already_loaded : 0;
+                    SRV_WRN("number of models to load on startup (%zu) exceeds models_max (%d), loading first %zu\n",
+                        models_to_load.size(), params.models_max, to_keep);
+                    models_to_load.resize(to_keep);
                 }
                 for (const auto & model_name : models_to_load) {
                     SRV_INF("(startup) loading model %s\n", model_name.c_str());
