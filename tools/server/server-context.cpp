@@ -3213,6 +3213,10 @@ std::string server_context::get_current_model_name() const {
     return impl->model_name;
 }
 
+std::string server_context::get_current_model_path() const {
+    return impl->params_base.model.path;
+}
+
 const server_chat_params& server_context::get_chat_params() const {
     return impl->chat_params;
 }
@@ -3593,10 +3597,11 @@ void server_routes::init_routes() {
     // Helper: swap to a model if different from current
     swap_if_needed_fn = [this](const std::string & requested_model) {
         if (requested_model.empty() || !model_manager) return;
-        std::string cur = ctx_server_ref.get_current_model_name();
-        if (requested_model == cur) return;
         auto meta_resolved = model_manager->get_meta(requested_model);
         if (!meta_resolved.has_value()) return;
+        // Compare by model path instead of name, since the requested name
+        // could be an alias or differ from how model_name was derived at load time
+        if (meta_resolved->model_path == ctx_server_ref.get_current_model_path()) return;
         common_params swap_params = params;
         swap_params.model.path = meta_resolved->model_path;
         SRV_INF("swapping to model '%s' (path: %s)\n", requested_model.c_str(), swap_params.model.path.c_str());
