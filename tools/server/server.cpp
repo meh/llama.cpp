@@ -400,6 +400,7 @@ int main(int argc, char ** argv) {
             base_info.tags = params.model_tags;
             base_info.status = SERVER_MODEL_STATUS_LOADED;
             base_info.last_used = ggml_time_ms();
+            base_info.preset = cli_load_result.base_preset;
             if (!base_info.name.empty()) {
                 model_manager->add_model(std::move(base_info));
             }
@@ -453,6 +454,7 @@ int main(int argc, char ** argv) {
                         }
                     }
 
+                    info.preset = mp;
                     SRV_INF("registering model '%s' (status=%d)\n", info.name.c_str(), (int)info.status);
                     model_manager->add_model(std::move(info));
                 }
@@ -703,6 +705,7 @@ int main(int argc, char ** argv) {
                     }
                 }
 
+                info.preset = preset;
                 model_manager->add_model(std::move(info));
 
                 // Check autoload
@@ -723,6 +726,7 @@ int main(int argc, char ** argv) {
                 base_info.tags = params.model_tags;
                 base_info.status = SERVER_MODEL_STATUS_LOADED;
                 base_info.last_used = ggml_time_ms();
+                base_info.preset = base_preset;
                 model_manager->add_model(std::move(base_info));
             }
 
@@ -849,6 +853,12 @@ int main(int argc, char ** argv) {
                 common_params load_params = params;
                 if (!path.empty()) {
                     load_params.model.path = path;
+                }
+
+                // Apply model preset (e.g. --reasoning, --chat-template-kwargs, etc.)
+                auto preset = model_mgr->get_preset(name);
+                if (preset.has_value()) {
+                    preset->apply_to_params(load_params);
                 }
 
                 // Load the model via model manager (handles LRU eviction)
