@@ -3604,6 +3604,11 @@ void server_routes::init_routes() {
         if (meta_resolved->model_path == ctx_server_ref.get_current_model_path()) return;
         common_params swap_params = params;
         swap_params.model.path = meta_resolved->model_path;
+        // Apply model preset (e.g. --reasoning, --chat-template-kwargs, etc.)
+        auto preset = model_manager->get_preset(requested_model);
+        if (preset.has_value()) {
+            preset->apply_to_params(swap_params);
+        }
         SRV_INF("swapping to model '%s' (path: %s)\n", requested_model.c_str(), swap_params.model.path.c_str());
         ctx_server_ref.swap_model(swap_params);
         meta = std::make_unique<server_context_meta>(get_ctx_meta());

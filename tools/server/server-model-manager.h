@@ -34,6 +34,7 @@ struct server_model_info {
     int64_t last_used = 0;      // for LRU eviction (milliseconds since epoch)
     int exit_code = 0;          // exit code if failed
     bool cached = false;        // GGUF file is cached in page cache for fast swapping
+    common_preset preset;       // per-model preset for applying to common_params at load/swap time
 
     bool is_ready() const {
         return status == SERVER_MODEL_STATUS_LOADED;
@@ -98,6 +99,10 @@ public:
 
     // Cache all models' GGUF files in page cache
     void cache_all();
+
+    // Get the per-model preset for a given model name (resolves aliases)
+    // Returns empty optional if model not found or no preset set
+    std::optional<common_preset> get_preset(const std::string& name) const;
 
 private:
     // Find the LRU model name (must be called with mutex_ held)
