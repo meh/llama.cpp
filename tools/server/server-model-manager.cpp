@@ -183,6 +183,13 @@ void server_model_manager::load_locked(const std::string& name, server_context& 
     info.status = SERVER_MODEL_STATUS_LOADING;
     info.last_used = ggml_time_ms();
 
+    // Apply model preset to params (e.g. --reasoning, --chat-template-kwargs, etc.)
+    // This is a safety net: the caller may have already applied the preset,
+    // but we ensure it's applied here if the caller didn't.
+    if (!info.preset.options.empty()) {
+        info.preset.apply_to_params(params);
+    }
+
     // Use this model's path, not the global params path
     std::string saved_path = params.model.path;
     params.model.path = info.model_path;
@@ -310,6 +317,19 @@ void server_model_manager::cache_all() {
     for (const auto& name : names) {
         cache(name);
     }
+}
+
+std::optional<common_preset> server_model_manager::get_preset(const std::string& name) const {
+    std::lock_guard<std::mutex> lk(mutex_);
+    std::string canonical = resolve_model_name(name);
+    if (canonical.empty()) {
+        return std::nullopt;
+    }
+    auto it = mapping_.find(canonical);
+    if (it == mapping_.end()) {
+        return std::nullopt;
+    }
+    return it->second.preset;
 }
 
 void server_model_manager::unload_lru(server_context& ctx) {
