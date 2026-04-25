@@ -81,6 +81,9 @@ struct server_context {
     // Get the currently loaded model's name
     std::string get_current_model_name() const;
 
+    // Get the currently loaded model's path
+    std::string get_current_model_path() const;
+
     // Get the currently loaded model's chat params
     const server_chat_params& get_chat_params() const;
 
