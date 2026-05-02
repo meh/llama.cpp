@@ -166,6 +166,9 @@ void common_preset::merge(const common_preset & other, bool overwrite_existing) 
 }
 
 void common_preset::apply_to_params(common_params & params) const {
+    params.default_template_kwargs.clear();
+    params.enable_reasoning = -1;
+    params.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
     for (const auto & [opt, val] : options) {
         // apply each option to params
         if (opt.handler_string) {
