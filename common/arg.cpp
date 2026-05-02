@@ -3155,6 +3155,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--chat-template-kwargs"}, "STRING",
         "sets additional params for the json template parser, must be a valid json object string, e.g. '{\"key1\":\"value1\",\"key2\":\"value2\"}'",
         [](common_params & params, const std::string & value) {
+            params.default_template_kwargs.clear();
             auto parsed = json::parse(value);
             for (const auto & item : parsed.items()) {
                 if (item.key() == "enable_thinking") {
