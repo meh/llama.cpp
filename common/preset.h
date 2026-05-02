@@ -43,7 +43,7 @@ struct common_preset {
     void merge(const common_preset & other, bool overwrite_existing = true);
 
     // apply preset options to common_params
-    void apply_to_params(common_params & params) const;
+    void apply_to_params(common_params & params, const std::set<std::string> & handled_keys = std::set<std::string>()) const;
 };
 
 // interface for multiple presets in one file
