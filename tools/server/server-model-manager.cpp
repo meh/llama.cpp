@@ -232,8 +232,12 @@ void server_model_manager::unload(const std::string& name, server_context& ctx) 
     info.status = SERVER_MODEL_STATUS_UNLOADED;
     info.last_used = 0;
 
-    // Call server_context's unload
-    ctx.unload_current_model();
+    // Only destroy the model in ctx_server if this model is the one currently loaded.
+    // Without this guard, unloading any model marked LOADED would destroy whatever
+    // ctx_server happens to hold (which may be a different model).
+    if (ctx.has_model_loaded() && ctx.get_current_model_path() == info.model_path) {
+        ctx.unload_current_model();
+    }
 
     cv_.notify_all();
 }
