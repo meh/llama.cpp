@@ -411,7 +411,11 @@ int llama_server(int argc, char ** argv) {
             base_info.tags = params.model_tags;
             base_info.status = SERVER_MODEL_STATUS_LOADED;
             base_info.last_used = ggml_time_ms();
-            base_info.preset = cli_load_result.base_preset;
+            // Args after the first -- are this model's per-model preset; args before -- are
+            // global defaults already in `params`, so on reload we re-apply only this preset.
+            base_info.preset = cli_load_result.model_presets.empty()
+                ? cli_load_result.base_preset
+                : cli_load_result.model_presets[0];
             if (!base_info.name.empty()) {
                 model_manager->add_model(std::move(base_info));
             }
@@ -512,6 +516,17 @@ int llama_server(int argc, char ** argv) {
             params.model.path = cli_base_model_path;
         }
 
+        // Build the first model's load params: global defaults (`params`, args before --)
+        // overlaid with its own per-model preset (args in the first -- block). Each model is
+        // independent — keep `params` unmutated so other models don't inherit this one's args.
+        common_params first_model_params = params;
+        if (cli_has_model_presets && !cli_load_result.model_presets.empty()) {
+            cli_load_result.model_presets[0].apply_to_params(first_model_params);
+            if (!cli_base_model_path.empty()) {
+                first_model_params.model.path = cli_base_model_path;
+            }
+        }
+
         // load the model
         SRV_INF("%s", "loading model\n");
 
@@ -521,7 +536,7 @@ int llama_server(int argc, char ** argv) {
             });
         }
 
-        if (!ctx_server.load_model(params)) {
+        if (!ctx_server.load_model(first_model_params)) {
             clean_up();
             if (ctx_http.thread.joinable()) {
                 ctx_http.thread.join();
@@ -878,7 +893,7 @@ int llama_server(int argc, char ** argv) {
                 return res;
             }));
 
-            ctx_http.post("/models/unload", ex_wrapper([model_mgr2 = model_manager.get(), &ctx_server, model_manager_base_model_name](const server_http_req & req) -> server_http_res_ptr {
+            ctx_http.post("/models/unload", ex_wrapper([model_mgr2 = model_manager.get(), &ctx_server](const server_http_req & req) -> server_http_res_ptr {
                 auto res = std::make_unique<server_http_res>();
                 json body = json::parse(req.body);
                 std::string name = json_value(body, "model", std::string());
@@ -892,13 +907,6 @@ int llama_server(int argc, char ** argv) {
                 if (!model_mgr2->has_model(name)) {
                     res->status = 404;
                     res->data = safe_json_to_str({{"error", format_error_response("model not found", ERROR_TYPE_NOT_FOUND)}});
-                    return res;
-                }
-
-                // Don't allow unloading the base model
-                if (name == model_manager_base_model_name) {
-                    res->status = 400;
-                    res->data = safe_json_to_str({{"error", format_error_response("base model cannot be unloaded", ERROR_TYPE_INVALID_REQUEST)}});
                     return res;
                 }
 
