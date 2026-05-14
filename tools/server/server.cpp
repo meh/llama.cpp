@@ -824,7 +824,12 @@ int main(int argc, char ** argv) {
                     }
                 }
             }
+        }
 
+        // /models/load and /models/unload registration:
+        //   - model_manager present (router-less multi-model or CLI -- presets): dispatch by name
+        //   - single-model mode: operate on ctx_server directly so VRAM can be freed/restored
+        if (model_manager) {
             // Wire up model_manager pointer to routes
             routes.set_model_manager(model_manager.get());
 
@@ -962,6 +967,25 @@ int main(int argc, char ** argv) {
                 }
                 return res;
             });
+        } else {
+            // Single-model mode: free VRAM in place, keep prompt_cache in RAM warm.
+            ctx_http.post("/models/unload", ex_wrapper([&ctx_server](const server_http_req &) -> server_http_res_ptr {
+                auto res = std::make_unique<server_http_res>();
+                ctx_server.unload_current_model();
+                res_ok(res, {{"success", true}});
+                return res;
+            }));
+
+            ctx_http.post("/models/load", ex_wrapper([&ctx_server, &params](const server_http_req &) -> server_http_res_ptr {
+                auto res = std::make_unique<server_http_res>();
+                if (!ctx_server.load_model(params)) {
+                    res->status = 500;
+                    res->data = safe_json_to_str({{"error", format_error_response("failed to load model", ERROR_TYPE_SERVER)}});
+                    return res;
+                }
+                res_ok(res, {{"success", true}});
+                return res;
+            }));
         }
 
         routes.update_meta(ctx_server);
