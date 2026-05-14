@@ -1115,7 +1115,11 @@ private:
             }
             SRV_INF("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
-            prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+            // Preserve existing cache across unload/reload cycles so saved slot
+            // KV survives the VRAM teardown done by unload_current_model().
+            if (!prompt_cache) {
+                prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+            }
         } else {
             SRV_INF("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
         }
@@ -1214,6 +1218,14 @@ private:
             if (wait_count > 10000) {
                 SRV_ERR("%s", "timeout waiting for slots to be idle before unload\n");
                 return;
+            }
+        }
+
+        // Snapshot live slot KV to the host-side prompt_cache so it survives the
+        // VRAM teardown below and can be restored on the next matching prompt.
+        if (prompt_cache) {
+            for (auto & slot : slots) {
+                slot_save_and_clear(slot);
             }
         }
 
