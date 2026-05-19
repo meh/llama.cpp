@@ -725,6 +725,21 @@ private:
         mtmd_free(mctx);
         mctx = nullptr;
 
+        for (server_slot & slot : slots) {
+            if (slot.can_speculate()) {
+                slot.spec.reset();
+            }
+        }
+
+        // Free the shared DFlash drafter context after all specs are gone
+        // (specs hold non-owning refs, so this must come last).
+        ctx_dft_shared.reset();
+
+        // Drafter weights live on GPU; release them so unload actually frees VRAM.
+        // Must come after ctx_dft_shared.reset() (drafter ctx references model_dft).
+        params_base.speculative.model_dft = nullptr;
+        model_dft.reset();
+
         llama_batch_free(batch);
     }
 
