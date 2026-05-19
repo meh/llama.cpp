@@ -760,6 +760,11 @@ private:
         // (specs hold non-owning refs, so this must come last).
         ctx_dft_shared.reset();
 
+        // Drafter weights live on GPU; release them so unload actually frees VRAM.
+        // Must come after ctx_dft_shared.reset() (drafter ctx references model_dft).
+        params_base.speculative.model_dft = nullptr;
+        model_dft.reset();
+
         llama_batch_free(batch);
     }
 
