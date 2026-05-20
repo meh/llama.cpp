@@ -82,6 +82,15 @@ public:
     // Unload all models
     void unload_all(server_context& ctx);
 
+    // Unload all currently running models, remembering their names so a
+    // subsequent load_remembered() call restores them. Returns the names
+    // that were unloaded.
+    std::vector<std::string> unload_all_running(server_context& ctx);
+
+    // Move out the list of names recorded by unload_all_running(); the
+    // manager keeps no record after this call.
+    std::vector<std::string> take_last_unloaded();
+
     // Unload the LRU model
     void unload_lru(server_context& ctx);
 
@@ -122,6 +131,7 @@ private:
     mutable std::mutex mutex_;
     std::condition_variable cv_;
     std::map<std::string, server_model_info> mapping_;
+    std::vector<std::string> last_unloaded_;
     int models_max_;
     bool models_autoload_;
 };

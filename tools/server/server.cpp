@@ -847,13 +847,30 @@ int llama_server(int argc, char ** argv) {
             // Register /models/load and /models/unload endpoints
             ctx_http.post("/models/load", ex_wrapper([model_mgr = model_manager.get(), &ctx_server, &params, model_manager_base_model_name](const server_http_req & req) -> server_http_res_ptr {
                 auto res = std::make_unique<server_http_res>();
-                json body = json::parse(req.body);
+                json body = req.body.empty() ? json::object() : json::parse(req.body);
                 std::string name = json_value(body, "model", std::string());
                 std::string path = json_value(body, "path", std::string());
 
+                // No identifier: reload the set captured by the most recent
+                // unload-all (POST /models/unload with no body).
                 if (name.empty() && path.empty()) {
-                    res->status = 400;
-                    res->data = safe_json_to_str({{"error", format_error_response("model name or path is required", ERROR_TYPE_INVALID_REQUEST)}});
+                    auto to_load = model_mgr->take_last_unloaded();
+                    if (to_load.empty()) {
+                        res->status = 400;
+                        res->data = safe_json_to_str({{"error", format_error_response("no previously unloaded models to reload", ERROR_TYPE_INVALID_REQUEST)}});
+                        return res;
+                    }
+                    json loaded = json::array();
+                    for (const auto & mname : to_load) {
+                        common_params load_params = params;
+                        auto preset = model_mgr->get_preset(mname);
+                        if (preset.has_value()) {
+                            preset->apply_to_params(load_params);
+                        }
+                        model_mgr->load(mname, ctx_server, load_params);
+                        loaded.push_back(mname);
+                    }
+                    res_ok(res, {{"success", true}, {"loaded", loaded}});
                     return res;
                 }
 
@@ -900,12 +917,14 @@ int llama_server(int argc, char ** argv) {
 
             ctx_http.post("/models/unload", ex_wrapper([model_mgr2 = model_manager.get(), &ctx_server](const server_http_req & req) -> server_http_res_ptr {
                 auto res = std::make_unique<server_http_res>();
-                json body = json::parse(req.body);
+                json body = req.body.empty() ? json::object() : json::parse(req.body);
                 std::string name = json_value(body, "model", std::string());
 
+                // No identifier: unload every running model and remember the set
+                // so a subsequent POST /models/load with no body restores it.
                 if (name.empty()) {
-                    res->status = 400;
-                    res->data = safe_json_to_str({{"error", format_error_response("model name is required", ERROR_TYPE_INVALID_REQUEST)}});
+                    auto unloaded = model_mgr2->unload_all_running(ctx_server);
+                    res_ok(res, {{"success", true}, {"unloaded", unloaded}});
                     return res;
                 }
 

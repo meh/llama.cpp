@@ -265,6 +265,31 @@ void server_model_manager::unload_all(server_context& ctx) {
     ctx.unload_current_model();
 }
 
+std::vector<std::string> server_model_manager::unload_all_running(server_context& ctx) {
+    std::lock_guard<std::mutex> lk(mutex_);
+
+    std::vector<std::string> unloaded;
+    for (auto& [name, info] : mapping_) {
+        if (info.is_running()) {
+            SRV_INF("unloading model '%s'\n", name.c_str());
+            info.status = SERVER_MODEL_STATUS_UNLOADED;
+            info.last_used = 0;
+            unloaded.push_back(name);
+        }
+    }
+    if (ctx.has_model_loaded()) {
+        ctx.unload_current_model();
+    }
+    last_unloaded_ = unloaded;
+    cv_.notify_all();
+    return unloaded;
+}
+
+std::vector<std::string> server_model_manager::take_last_unloaded() {
+    std::lock_guard<std::mutex> lk(mutex_);
+    return std::move(last_unloaded_);
+}
+
 void server_model_manager::wait_until_loading_finished(const std::string& name) {
     std::unique_lock<std::mutex> lk(mutex_);
     std::string canonical = resolve_model_name(name);
