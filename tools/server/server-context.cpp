@@ -4136,6 +4136,10 @@ void server_routes::init_routes() {
     // Helper: swap to a model if different from current
     swap_if_needed_fn = [this](const std::string & requested_model) {
         if (requested_model.empty() || !model_manager) return;
+        // If another thread is currently loading the requested model, block
+        // here until it finishes so we don't return an error or kick off a
+        // duplicate swap on top of an in-flight load.
+        model_manager->wait_until_loading_finished(requested_model);
         auto meta_resolved = model_manager->get_meta(requested_model);
         if (!meta_resolved.has_value()) return;
         // Compare by model path instead of name, since the requested name
