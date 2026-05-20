@@ -22,6 +22,7 @@
 #include <exception>
 #include <memory>
 #include <filesystem>
+#include <mutex>
 #include <utility>
 #include <thread>
 
@@ -738,7 +739,15 @@ private:
 
     bool sleeping = false;
 
+    // Guards model-lifetime mutations (destroy/load_model) against meta reads
+    // from handler threads (get_meta). Recursive because swap_model() and the
+    // SWAP task handler hold it across nested destroy() + load_model() calls.
+    // Known latent races NOT covered: handler-thread tokenize against unload,
+    // and dangling chat_params reference in cached meta after swap.
+    mutable std::recursive_mutex model_mtx;
+
     void destroy() {
+        std::lock_guard<std::recursive_mutex> lk(model_mtx);
         // Note: sleeping is set to true by handle_sleeping_state after destroy().
         // unload_current_model() must also set sleeping = true to prevent
         // the destructor from calling destroy() again (double free).
@@ -825,6 +834,7 @@ private:
     // load the model and initialize llama_context
     // this may also be called to resume from sleeping state
     bool load_model(common_params & params) {
+        std::lock_guard<std::recursive_mutex> lk(model_mtx);
         bool is_resume = sleeping;
 
         SRV_INF("loading model '%s'\n", params.model.path.c_str());
@@ -2434,6 +2444,10 @@ private:
                 {
                     SRV_INF("swapping model: %s\n", task.swap_params.model.name.c_str());
 
+                    // Hold model_mtx across unload+load so concurrent get_meta()
+                    // readers can't observe the empty window between them.
+                    std::lock_guard<std::recursive_mutex> lk(model_mtx);
+
                     // Destroy current model
                     routes_ptr->ctx_server_ref.unload_current_model();
 
@@ -3759,6 +3773,11 @@ server_response_reader server_context::get_response_reader() {
 }
 
 server_context_meta server_context::get_meta() const {
+    // Lock against model-lifetime mutations (destroy/load_model/SWAP task)
+    // so that vocab/ctx/model/json_webui_settings/chat_params are stable
+    // for the duration of the snapshot construction. Recursive: safe to
+    // call from contexts that may already hold the lock.
+    std::lock_guard<std::recursive_mutex> lk(impl->model_mtx);
     auto bos_id = llama_vocab_bos(impl->vocab);
     auto eos_id = llama_vocab_eos(impl->vocab);
     auto bos_token_str = bos_id != LLAMA_TOKEN_NULL ? common_token_to_piece(impl->ctx, bos_id, true) : "";
